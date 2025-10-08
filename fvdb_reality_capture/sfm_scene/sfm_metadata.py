@@ -447,7 +447,8 @@ class SfmImageMetadata:
         )
         image_id = int(state_dict["image_id"])
 
-        assert camera_id in camera_metadata, f"Camera ID {camera_id} not found in camera_metadata"
+        if camera_id not in camera_metadata:
+            raise KeyError(f"Camera ID {camera_id} not found in camera_metadata")
 
         return cls(
             world_to_camera_matrix=world_to_camera_matrix,

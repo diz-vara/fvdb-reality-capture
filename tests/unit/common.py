@@ -158,8 +158,6 @@ def sfm_scenes_match(scene1: SfmScene, scene2: SfmScene) -> bool:
         return False
     if len(scene1.images) != len(scene2.images):
         return False
-    if not np.allclose(scene1.transformation_matrix, scene2.transformation_matrix):
-        return False
     if not np.allclose(scene1.world_to_camera_matrices, scene2.world_to_camera_matrices):
         return False
     if not np.allclose(scene1.camera_to_world_matrices, scene2.camera_to_world_matrices):
