@@ -4,63 +4,127 @@
 import logging
 import pathlib
 import time
+from dataclasses import dataclass
 from typing import Literal
 
+import numpy as np
 import torch
 import tyro
+from fvdb.viz import Viewer
 
-from fvdb_reality_capture.training import Config, SceneOptimizationRunner
+from fvdb_reality_capture import SfmScene
+from fvdb_reality_capture.training import (
+    GaussianSplatOptimizerConfig,
+    SceneOptimizationConfig,
+    SceneOptimizationRunner,
+)
+from fvdb_reality_capture.transforms import (
+    Compose,
+    CropScene,
+    CropSceneToPoints,
+    DownsampleImages,
+    FilterImagesWithLowPoints,
+    NormalizeScene,
+    PercentileFilterPoints,
+)
+
+
+@dataclass
+class SceneTransformConfig:
+    """
+    Configuration for the transforms to apply to the SfmScene before training.
+    """
+
+    # Downsample images by this factor
+    image_downsample_factor: int = 4
+    # JPEG quality to use when resaving images after downsampling
+    rescale_jpeg_quality: int = 95
+    # Percentile of points to filter out based on their distance from the median point
+    points_percentile_filter: float = 0.0
+    # Type of normalization to apply to the scene
+    normalization_type: Literal["none", "pca", "ecef2enu", "similarity"] = "pca"
+    # Optional bounding box (in the normalized space) to crop the scene to (xmin, xmax, ymin, ymax, zmin, zmax)
+    crop_bbox: tuple[float, float, float, float, float, float] | None = None
+    # Whether to crop the scene to the bounding box or not
+    crop_to_points: bool = False
+    # Minimum number of 3D points that must be visible in an image for it to be included in training
+    min_points_per_image: int = 5
+    # Bounding box to which we crop the scene (in the original space) (xmin, xmax, ymin, ymax, zmin, zmax)
+    crop_bbox: tuple[float, float, float, float, float, float] | None = None
+
+    @property
+    def scene_transform(self):
+        # Dataset transform
+        transforms = [
+            NormalizeScene(normalization_type=self.normalization_type),
+            PercentileFilterPoints(
+                percentile_min=np.full((3,), self.points_percentile_filter),
+                percentile_max=np.full((3,), 100.0 - self.points_percentile_filter),
+            ),
+            DownsampleImages(
+                image_downsample_factor=self.image_downsample_factor,
+                rescaled_jpeg_quality=self.rescale_jpeg_quality,
+            ),
+            FilterImagesWithLowPoints(min_num_points=self.min_points_per_image),
+        ]
+        if self.crop_bbox is not None:
+            transforms.append(CropScene(self.crop_bbox))
+        if self.crop_to_points:
+            transforms.append(CropSceneToPoints(margin=0.0))
+        return Compose(*transforms)
 
 
 def main(
     dataset_path: pathlib.Path,
-    cfg: Config = Config(),
+    cfg: SceneOptimizationConfig = SceneOptimizationConfig(),
+    tx: SceneTransformConfig = SceneTransformConfig(),
+    opt: GaussianSplatOptimizerConfig = GaussianSplatOptimizerConfig(),
     run_name: str | None = None,
-    image_downsample_factor: int = 4,
-    points_percentile_filter: float = 0.0,
-    normalization_type: Literal["none", "pca", "ecef2enu", "similarity"] = "pca",
-    crop_bbox: tuple[float, float, float, float, float, float] | None = None,
-    crop_to_points: bool = False,
-    min_points_per_image: int = 5,
     results_path: pathlib.Path = pathlib.Path("results"),
     device: str | torch.device = "cuda",
-    use_every_n_as_val: int = 8,
-    disable_viewer: bool = False,
-    log_tensorboard_every: int = 100,
-    log_images_to_tensorboard: bool = False,
+    use_every_n_as_val: int = -1,
+    visualize_every: int = -1,
+    log_tensorboard_every: int = -1,
     save_results: bool = True,
     save_eval_images: bool = False,
     verbose: bool = False,
-    dataset_type: Literal["colmap", "simple_directory"] = "colmap",
+    dataset_type: Literal["colmap", "simple_directory", "e57"] = "colmap",
 ):
     log_level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s : %(message)s")
 
-    runner = SceneOptimizationRunner.new_run(
+    if dataset_type == "colmap":
+        sfm_scene = SfmScene.from_colmap(dataset_path)
+    elif dataset_type == "simple_directory":
+        sfm_scene = SfmScene.from_simple_directory(dataset_path)
+    elif dataset_type == "e57":
+        sfm_scene = SfmScene.from_e57(dataset_path)
+    else:
+        raise ValueError(f"Unsupported dataset_type {dataset_type}")
+
+    if visualize_every > 0:
+        viewer = Viewer()
+    else:
+        viewer = None
+
+    runner = SceneOptimizationRunner.from_sfm_scene(
+        tx.scene_transform(sfm_scene),
         config=cfg,
-        dataset_path=dataset_path,
+        optimizer_config=opt,
         run_name=run_name,
-        image_downsample_factor=image_downsample_factor,
-        points_percentile_filter=points_percentile_filter,
-        normalization_type=normalization_type,
-        crop_bbox=crop_bbox,
-        crop_to_points=crop_to_points,
-        min_points_per_image=min_points_per_image,
-        results_path=results_path,
+        results_path=results_path if save_results else None,
         device=device,
         use_every_n_as_val=use_every_n_as_val,
-        disable_viewer=disable_viewer,
         log_tensorboard_every=log_tensorboard_every,
-        log_images_to_tensorboard=log_images_to_tensorboard,
-        save_results=save_results,
         save_eval_images=save_eval_images,
-        dataset_type=dataset_type,
+        viewer=viewer,
+        update_viewer_every=visualize_every,
     )
 
     runner.train()
 
     logger = logging.getLogger("train")
-    if not disable_viewer:
+    if viewer is not None:
         logger.info("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
 

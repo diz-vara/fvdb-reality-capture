@@ -2,19 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-from .checkpoint import Checkpoint
 from .gaussian_splat_optimizer import (
     GaussianSplatOptimizer,
     GaussianSplatOptimizerConfig,
     InsertionGrad2dThresholdMode,
 )
-from .scene_optimization_runner import Config, SceneOptimizationRunner
+from .scene_optimization_runner import SceneOptimizationConfig, SceneOptimizationRunner
 from .sfm_dataset import SfmDataset
 
 __all__ = [
     "SceneOptimizationRunner",
-    "Config",
-    "Checkpoint",
+    "SceneOptimizationConfig",
     "SfmDataset",
     "GaussianSplatOptimizer",
     "GaussianSplatOptimizerConfig",

@@ -2,10 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-import functools
-import multiprocessing
 import pathlib
-import shutil
 import tempfile
 import unittest
 

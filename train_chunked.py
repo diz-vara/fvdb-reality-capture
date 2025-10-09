@@ -16,7 +16,11 @@ import tyro
 from fvdb import GaussianSplat3d
 
 from fvdb_reality_capture.sfm_scene import SfmScene
-from fvdb_reality_capture.training import Config, SceneOptimizationRunner, SfmDataset
+from fvdb_reality_capture.training import (
+    SceneOptimizationConfig,
+    SceneOptimizationRunner,
+    SfmDataset,
+)
 from fvdb_reality_capture.transforms import (
     Compose,
     DownsampleImages,
@@ -65,7 +69,7 @@ def _run_on_chunk(
     chunk_id: int,
     chunk_bboxes: Sequence[tuple[float, float, float, float, float, float]],
     dataset_path: pathlib.Path,
-    cfg: Config,
+    cfg: SceneOptimizationConfig,
     chunk_run_name_prefix: str,
     image_downsample_factor: int,
     points_percentile_filter: float,
@@ -186,7 +190,7 @@ def main(
     ny: int = 1,
     nz: int = 1,
     overlap_percent: float = 0.1,
-    cfg: Config = Config(remove_gaussians_outside_scene_bbox=True),
+    cfg: SceneOptimizationConfig = SceneOptimizationConfig(remove_gaussians_outside_scene_bbox=True),
     run_name: str | None = None,
     image_downsample_factor: int = 4,
     points_percentile_filter: float = 0.0,

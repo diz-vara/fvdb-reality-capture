@@ -16,7 +16,10 @@ from typing import Dict, List
 import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent.resolve()))
-from fvdb_reality_capture.training import Config, SceneOptimizationRunner
+from fvdb_reality_capture.training import (
+    SceneOptimizationConfig,
+    SceneOptimizationRunner,
+)
 
 logger = logging.getLogger("train benchmark checkpoints")
 
@@ -95,7 +98,7 @@ def main(
     training_params = config["optimization_config"]["training_arguments"]
 
     # Create base Config object
-    base_config = Config()
+    base_config = SceneOptimizationConfig()
 
     # Override config with values from YAML
     for key, value in config["optimization_config"]["optimization_config"].items():

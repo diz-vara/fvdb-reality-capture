@@ -5,12 +5,20 @@
 from . import foundation_models, tools, training, transforms, viewer
 from .sfm_scene import SfmCache, SfmCameraMetadata, SfmImageMetadata, SfmScene
 from .tools import download_example_data
+from .training import (
+    GaussianSplatOptimizerConfig,
+    SceneOptimizationConfig,
+    SceneOptimizationRunner,
+)
 
 __all__ = [
     "foundation_models",
     "sfm_scene",
     "tools",
     "training",
+    "SceneOptimizationConfig",
+    "GaussianSplatOptimizerConfig",
+    "SceneOptimizationRunner",
     "transforms",
     "viewer",
     "download_example_data",

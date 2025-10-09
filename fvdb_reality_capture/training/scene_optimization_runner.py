@@ -1,7 +1,6 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-import itertools
 import json
 import logging
 import pathlib
@@ -24,29 +23,18 @@ from scipy.spatial import cKDTree  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
 
 from ..sfm_scene import SfmScene
-from ..transforms import (
-    BaseTransform,
-    Compose,
-    CropScene,
-    CropSceneToPoints,
-    DownsampleImages,
-    FilterImagesWithLowPoints,
-    NormalizeScene,
-    PercentileFilterPoints,
-)
 from .camera_pose_adjust import CameraPoseAdjustment
-from .checkpoint import Checkpoint
 from .gaussian_splat_optimizer import (
     GaussianSplatOptimizer,
     GaussianSplatOptimizerConfig,
 )
 from .lpips import LPIPSLoss
 from .sfm_dataset import SfmDataset
-from .utils import make_unique_name_directory_based_on_time
+from .utils import crop_image_batch, make_unique_name_directory_based_on_time
 
 
 @dataclass
-class Config:
+class SceneOptimizationConfig:
     """
     Parameters for the radiance field optimization process.
     See the comments for each parameter for details.
@@ -67,8 +55,6 @@ class Config:
     eval_at_percent: List[int] = field(default_factory=lambda: [10, 20, 30, 40, 50, 75, 100])
     # Percentage of total epochs at which we save the model checkpoint. i.e. 10 means save a checkpoint after 10% of the epochs.
     save_at_percent: List[int] = field(default_factory=lambda: [20, 100])
-    # How often to update the viewer with training statistics and the current splat model (in epochs)
-    update_viewer_every_epochs: float = 2.0
 
     #
     # Gaussian Optimization Parameters
@@ -114,9 +100,6 @@ class Config:
     # If set to "scene_scale", the thresholds are multiplied by the scene scale
     optimizer_scale_3d_threshold_units: Literal["absolute", "scene_scale"] = "scene_scale"
 
-    # Configuration for the Gaussian Splat optimizer
-    opt: GaussianSplatOptimizerConfig = field(default_factory=GaussianSplatOptimizerConfig)
-
     #
     # Pose optimization parameters
     #
@@ -152,44 +135,6 @@ class Config:
     antialias: bool = False
     # Size of tiles to use during rasterization
     tile_size: int = 16
-
-
-def crop_image_batch(image: torch.Tensor, mask: torch.Tensor | None, ncrops: int):
-    """
-    Generator to iterate a minibatch of images (B, H, W, C) into disjoint patches patches (B, H_patch, W_patch, C).
-    We use this function when training on very large images so that we can accumulate gradients over
-    crops of each image.
-
-    Args:
-        image (torch.Tensor): Image minibatch (B, H, W, C)
-        mask (torch.Tensor | None): Optional mask of shape (B, H, W) to apply to the image.
-        ncrops (int): Number of chunks to split the image into (i.e. each crop will have shape (B, H/ncrops x W/ncrops, C).
-
-    Yields: A crop of the input image and its coordinate
-        image_patch (torch.Tensor): the patch with shape (B, H/ncrops, W/ncrops, C)
-        mask_patch (torch.Tensor | None): the mask patch with shape (B, H/ncrops, W/ncrops) or None if no mask is provided
-        crop (tuple[int, int, int, int]): the crop coordinates (x, y, w, h),
-        is_last (bool): is true if this is the last crop in the iteration
-    """
-    h, w = image.shape[1:3]
-    patch_w, patch_h = w // ncrops, h // ncrops
-    patches = np.array(
-        [
-            [i * patch_w, j * patch_h, (i + 1) * patch_w, (j + 1) * patch_h]
-            for i, j in itertools.product(range(ncrops), range(ncrops))
-        ]
-    )
-    for patch_id in range(patches.shape[0]):
-        x1, y1, x2, y2 = patches[patch_id]
-        image_patch = image[:, y1:y2, x1:x2]
-        mask_patch = None
-        if mask is not None:
-            mask_patch = mask[:, y1:y2, x1:x2]
-
-        crop = (x1, y1, (x2 - x1), (y2 - y1))
-        assert (x2 - x1) == patch_w and (y2 - y1) == patch_h
-        is_last = patch_id == (patches.shape[0] - 1)
-        yield image_patch, mask_patch, crop, is_last
 
 
 class TensorboardLogger:
@@ -285,7 +230,422 @@ class TensorboardLogger:
 class SceneOptimizationRunner:
     """Engine for training and testing."""
 
+    version = "0.1.0"
+
+    _magic = "GaussianSplattingCheckpoint"
+
     __PRIVATE__ = object()
+
+    @classmethod
+    def from_sfm_scene(
+        cls,
+        sfm_scene: SfmScene,
+        config: SceneOptimizationConfig = SceneOptimizationConfig(),
+        optimizer_config: GaussianSplatOptimizerConfig = GaussianSplatOptimizerConfig(),
+        use_every_n_as_val: int = -1,
+        run_name: str | None = None,
+        results_path: str | pathlib.Path | None = None,
+        viewer: Viewer | None = None,
+        update_viewer_every: int = 10,
+        device: str | torch.device = "cuda",
+        log_tensorboard_every: int = -1,
+        save_eval_images: bool = False,
+    ):
+        if isinstance(results_path, str):
+            results_path = pathlib.Path(results_path)
+
+        np.random.seed(config.seed)
+        random.seed(config.seed)
+        torch.manual_seed(config.seed)
+
+        logger = logging.getLogger(f"{cls.__module__}.{cls.__name__}")
+
+        train_indices, val_indices = cls._make_index_splits(sfm_scene, use_every_n_as_val)
+        train_dataset = SfmDataset(sfm_scene, train_indices)
+        val_dataset = SfmDataset(sfm_scene, val_indices)
+
+        logger.info(
+            f"Created dataset training and test datasets with {len(train_dataset)} training images and {len(val_dataset)} test images."
+        )
+
+        # Initialize model
+        model = SceneOptimizationRunner._init_model(config, device, train_dataset)
+        logger.info(f"Model initialized with {model.num_gaussians:,} Gaussians")
+
+        # Initialize optimizer
+        scene_scale = SceneOptimizationRunner._compute_scene_scale(train_dataset.sfm_scene)
+        max_steps = config.max_epochs * len(train_dataset)
+        mean_lr_decay_exponent = 0.01 ** (1.0 / max_steps)
+        # Copy the optimizer config so we don't modify the input config
+        opt_config = GaussianSplatOptimizerConfig(**vars(optimizer_config))
+        if config.optimizer_scale_3d_threshold_units == "scene_scale":
+            opt_config.deletion_scale_3d_threshold *= scene_scale * 1.1
+            opt_config.insertion_scale_3d_threshold *= scene_scale * 1.1
+        opt_config.means_lr *= scene_scale * 1.1  # Scale the means learning rate by the scene scale
+        optimizer = GaussianSplatOptimizer.from_model_and_config(
+            model=model,
+            config=opt_config,
+            means_lr_decay_exponent=mean_lr_decay_exponent,
+            batch_size=config.batch_size,
+        )
+
+        # Initialize pose optimizer
+        pose_adjust_model, pose_adjust_optimizer, pose_adjust_scheduler = None, None, None
+        if config.optimize_camera_poses:
+            pose_adjust_model, pose_adjust_optimizer, pose_adjust_scheduler = cls._make_pose_optimizer(
+                config, device, len(train_dataset)
+            )
+
+        # Setup output directories.
+        run_name, image_render_path, stats_path, checkpoints_path, tensorboard_path = (
+            SceneOptimizationRunner._make_or_get_results_directories(
+                run_name=run_name,
+                results_base_path=results_path,
+                save_eval_images=save_eval_images,
+                exists_ok=False,
+            )
+        )
+
+        return SceneOptimizationRunner(
+            config=config,
+            optimizer_config=optimizer_config,
+            sfm_scene=sfm_scene,
+            train_indices=train_indices,
+            val_indices=val_indices,
+            model=model,
+            optimizer=optimizer,
+            pose_adjust_model=pose_adjust_model,
+            pose_adjust_optimizer=pose_adjust_optimizer,
+            pose_adjust_scheduler=pose_adjust_scheduler,
+            start_step=0,
+            run_name=run_name,
+            image_render_path=image_render_path,
+            stats_path=stats_path,
+            checkpoints_path=checkpoints_path,
+            tensorboard_path=tensorboard_path,
+            log_tensorboard_every=log_tensorboard_every,
+            log_images_to_tensorboard=log_tensorboard_every > 0,
+            viewer=viewer,
+            update_viewer_every=update_viewer_every,
+            _private=SceneOptimizationRunner.__PRIVATE__,
+        )
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: str | pathlib.Path,
+        override_sfm_scene: SfmScene | None = None,
+        override_use_every_n_as_val: int | None = None,
+        override_results_path: pathlib.Path | str | None = None,
+        viewer: Viewer | None = None,
+        update_viewer_every: int = 10,
+        log_tensorboard_every: int = -1,
+        log_images_to_tensorboard: bool = False,
+        save_eval_images: bool = False,
+        device: str | torch.device = "cuda",
+    ) -> "SceneOptimizationRunner":
+        """
+        Create a `Runner` instance from a saved checkpoint.
+
+        Args:
+            checkpoint_path (str | pathlib.Path): The path to the checkpoint to load from.
+            override_sfm_scene (SfmScene | None): Optional SfM scene to override the one in the checkpoint.
+                This can be used to load a checkpoint on a different SfM scene (e.g., for fine-tuning).
+                The transform stored in the checkpoint will still be applied to this scene.
+                If None, the SfM scene from the checkpoint will be used.
+            override_use_every_n_as_val (int | None): If not None, overrides the use_every_n_as_val parameter
+                from the checkpoint config to determine the train/val split.
+                This can be used to change the train/val split when resuming from a checkpoint.
+                If None, the value from the checkpoint config will be used.
+            override_results_path (pathlib.Path | str | None): A saved checkpoint will always have a results path
+                associated with it. By default, we will use that path to save new results.
+                If this parameter is set, it will override the results path from the checkpoint.
+            viewer (Viewer | None): Optional viewer instance for visualizing training progress. If None, no viewer will be used.
+            update_viewer_every (int): How often to update the viewer with the latest model state.
+            log_tensorboard_every (int): How often to log metrics to TensorBoard.
+            log_images_to_tensorboard (bool): Whether to log images to TensorBoard.
+            save_eval_images (bool): Whether to save evaluation images during training.
+            device (str | torch.device): The device to run the model on (e.g., "cuda" or "cpu").
+        """
+        logger = logging.getLogger(f"{cls.__module__}.{cls.__name__}")
+
+        logger.info(f"Loading checkpoint from {checkpoint_path} on device {device}")
+        if isinstance(checkpoint_path, str):
+            checkpoint_path = pathlib.Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint path {checkpoint_path} does not exist.")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+        if checkpoint.get("magic", "") != cls._magic:
+            raise ValueError(f"Checkpoint at {checkpoint_path} is not a valid checkpoint file.")
+        if checkpoint.get("version", "") != cls.version:
+            raise ValueError(
+                f"Checkpoint version {checkpoint.get('version', '')} does not match current version {cls.version}."
+            )
+        if not isinstance(checkpoint.get("step", None), int):
+            raise ValueError("Checkpoint step is missing or invalid.")
+        if not isinstance(checkpoint.get("config", None), dict):
+            raise ValueError("Checkpoint config is missing or invalid.")
+        if not isinstance(checkpoint.get("sfm_scene", None), dict):
+            raise ValueError("Checkpoint SfM scene is missing or invalid.")
+        if not isinstance(checkpoint.get("splats", None), dict):
+            raise ValueError("Checkpoint model state is missing or invalid.")
+        if not isinstance(checkpoint.get("optimizer", None), dict):
+            raise ValueError("Checkpoint optimizer state is missing or invalid.")
+        if not isinstance(checkpoint.get("train_indices", None), (list, np.ndarray, torch.Tensor)):
+            raise ValueError("Checkpoint train indices are missing or invalid.")
+        if not isinstance(checkpoint.get("val_indices", None), (list, np.ndarray, torch.Tensor)):
+            raise ValueError("Checkpoint val indices are missing or invalid.")
+        if not isinstance(checkpoint.get("optimizer_config", None), dict):
+            raise ValueError("Checkpoint optimizer_config is missing or invalid.")
+        if not isinstance(checkpoint.get("run_name", None), str):
+            raise ValueError("Checkpoint run name is missing or invalid.")
+        if not isinstance(checkpoint.get("results_path", None), (str)):
+            raise ValueError("Checkpoint results_path is missing or invalid.")
+
+        results_path = override_results_path if override_results_path is not None else checkpoint["results_path"]
+        if isinstance(results_path, str):
+            results_path = pathlib.Path(results_path)
+
+        ckpt_results_path = checkpoint["results_path"]
+        if ckpt_results_path is not None and not isinstance(ckpt_results_path, str):
+            raise ValueError("Checkpoint results_path is invalid.")
+
+        # If you didn't specif a results path, use the one from the checkpoint
+        if results_path is None:
+            results_path = ckpt_results_path
+        if not isinstance(checkpoint.get("results_path", None), (str, type(None))):
+            raise ValueError("Checkpoint results_path is missing or invalid.")
+
+        if results_path is None:
+            raise ValueError("No results path specified and no results path found in checkpoint.")
+
+        global_step = checkpoint["step"]
+        run_name = checkpoint["run_name"] + "_resumed"
+        optimization_config = SceneOptimizationConfig(**checkpoint["config"])
+        optimizer_config = GaussianSplatOptimizerConfig(**checkpoint["optimizer_config"])
+        sfm_scene: SfmScene = SfmScene.from_state_dict(checkpoint["sfm_scene"])
+        train_indices = np.array(checkpoint["train_indices"], dtype=int)
+        val_indices = np.array(checkpoint["val_indices"], dtype=int)
+
+        model = GaussianSplat3d.from_state_dict(checkpoint["splats"])
+        optimizer = GaussianSplatOptimizer.from_state_dict(model, checkpoint["optimizer"])
+
+        logger.info(f"Loaded checkpoint with {model.num_gaussians:,} Gaussians.")
+
+        if override_sfm_scene is not None:
+            sfm_scene = override_sfm_scene
+            logger.info("Using override SfM scene instead of the one from the checkpoint.")
+            sfm_scene = checkpoint.dataset_transform(sfm_scene)
+
+        if override_use_every_n_as_val is not None:
+            indices = np.arange(sfm_scene.num_images)
+            if override_use_every_n_as_val > 0:
+                mask = np.ones(len(indices), dtype=bool)
+                mask[::override_use_every_n_as_val] = False
+                train_indices = indices[mask]
+                val_indices = indices[~mask]
+            else:
+                train_indices = indices
+                val_indices = np.array([], dtype=int)
+
+        if override_sfm_scene is not None:
+            if train_indices.min() < 0 or train_indices.max() >= sfm_scene.num_images:
+                raise ValueError(
+                    "Loaded training indices are out of bounds for the overridden SfM scene. If you are changing the SfM scene, you may also need to set override_use_every_n_as_val to change the train/val split."
+                )
+            if val_indices.size > 0 and (val_indices.min() < 0 or val_indices.max() >= sfm_scene.num_images):
+                raise ValueError(
+                    "Loaded validation indices are out of bounds for the overridden SfM scene. If you are changing the SfM scene, you may also need to set override_use_every_n_as_val to change the train/val split."
+                )
+
+        num_training_poses = len(train_indices)
+        if num_training_poses == 0:
+            raise ValueError("Checkpoint has no training poses.")
+
+        pose_adjust_model = None
+        pose_adjust_optimizer = None
+        pose_adjust_scheduler = None
+        if checkpoint.get("pose_adjust_model", None) is not None:
+            if not isinstance(checkpoint.get("pose_adjust_model", None), dict):
+                raise ValueError("Checkpoint pose adjustment model state is invalid.")
+            if not isinstance(checkpoint.get("pose_adjust_optimizer", None), dict):
+                raise ValueError("Checkpoint pose adjustment optimizer state is invalid.")
+            if not isinstance(checkpoint.get("pose_adjust_scheduler", None), dict):
+                raise ValueError("Checkpoint pose adjustment scheduler state is invalid.")
+            (
+                pose_adjust_model,
+                pose_adjust_optimizer,
+                pose_adjust_scheduler,
+            ) = cls._make_pose_optimizer(optimization_config, device, num_training_poses)
+            pose_adjust_model.load_state_dict(checkpoint["pose_adjust_model"])
+            pose_adjust_optimizer.load_state_dict(checkpoint["pose_adjust_optimizer"])
+            pose_adjust_scheduler.load_state_dict(checkpoint["pose_adjust_scheduler"])
+
+        if isinstance(results_path, str):
+            results_path = pathlib.Path(results_path)
+
+        # Setup output directories.
+        run_name, image_render_path, stats_path, checkpoints_path, tensorboard_path = (
+            SceneOptimizationRunner._make_or_get_results_directories(
+                run_name=run_name,
+                results_base_path=results_path,
+                save_eval_images=save_eval_images,
+            )
+        )
+
+        np.random.seed(optimization_config.seed)
+        random.seed(optimization_config.seed)
+        torch.manual_seed(optimization_config.seed)
+
+        return SceneOptimizationRunner(
+            config=optimization_config,
+            sfm_scene=sfm_scene,
+            optimizer_config=optimizer_config,
+            train_indices=train_indices,
+            val_indices=val_indices,
+            model=model,
+            optimizer=optimizer,
+            pose_adjust_model=pose_adjust_model,
+            pose_adjust_optimizer=pose_adjust_optimizer,
+            pose_adjust_scheduler=pose_adjust_scheduler,
+            start_step=global_step,
+            run_name=run_name,
+            image_render_path=image_render_path,
+            stats_path=stats_path,
+            checkpoints_path=checkpoints_path,
+            tensorboard_path=tensorboard_path,
+            log_tensorboard_every=log_tensorboard_every,
+            log_images_to_tensorboard=log_images_to_tensorboard,
+            viewer=viewer,
+            update_viewer_every=update_viewer_every,
+            _private=SceneOptimizationRunner.__PRIVATE__,
+        )
+
+    def __init__(
+        self,
+        config: SceneOptimizationConfig,
+        optimizer_config: GaussianSplatOptimizerConfig,
+        sfm_scene: SfmScene,
+        train_indices: np.ndarray,
+        val_indices: np.ndarray,
+        model: GaussianSplat3d,
+        optimizer: GaussianSplatOptimizer,
+        pose_adjust_model: CameraPoseAdjustment | None,
+        pose_adjust_optimizer: torch.optim.Adam | None,
+        pose_adjust_scheduler: torch.optim.lr_scheduler.ExponentialLR | None,
+        start_step: int,
+        run_name: str,
+        image_render_path: pathlib.Path | None,
+        stats_path: pathlib.Path | None,
+        checkpoints_path: pathlib.Path | None,
+        tensorboard_path: pathlib.Path | None,
+        log_tensorboard_every: int,
+        log_images_to_tensorboard: bool,
+        viewer: Viewer | None = None,
+        update_viewer_every: int = 10,
+        _private: object | None = None,
+    ) -> None:
+        """
+        Initialize the Runner with the provided configuration, model, optimizer, datasets, and paths.
+
+        Note: This constructor should only be called by the `new_run` or `resume_from_checkpoint` methods.
+
+        Args:
+            config (Config): Configuration object containing model parameters.
+            optimizer_config (GaussianSplatOptimizerConfig): Configuration for the optimizer.
+            sfm_scene (SfmScene): The Structure-from-Motion scene.
+            train_indices (np.ndarray): The indices for the training set.
+            val_indices (np.ndarray): The indices for the validation set.
+            model (GaussianSplat3d): The Gaussian Splatting model to train.
+            optimizer (GaussianSplatOptimizer | None): The optimizer for the model.
+            pose_adjust_model (CameraPoseAdjustment | None): The camera pose adjustment model, if used
+            pose_adjust_optimizer (torch.optim.Adam | None): The optimizer for camera pose adjustment, if used.
+            pose_adjust_scheduler (torch.optim.lr_scheduler.ExponentialLR | None): The learning rate scheduler
+                for camera pose adjustment, if used.
+            start_step (int): The step to start training from (useful for resuming training
+                from a checkpoint).
+            run_name (str | None): The name of the training run or None for an un-named run.
+            image_render_path (pathlib.Path | None): Path to save rendered images during evaluation.
+            stats_path (pathlib.Path | None): Path to save training statistics
+            checkpoints_path (pathlib.Path | None): Path to save model checkpoints.
+            tensorboard_path (pathlib.Path | None): Path to save TensorBoard logs.
+            log_tensorboard_every (int): How often to log metrics to TensorBoard.
+            log_images_to_tensorboard (bool): Whether to log images to TensorBoard.
+            viewer (Viewer | None): The viewer instance to use for this run.
+            update_viewer_every (int): How often to update the viewer with new training information.
+            _private (object | None): Private object to ensure this class is only initialized through `new_run` or `resume_from_checkpoint`.
+        """
+        if _private is not SceneOptimizationRunner.__PRIVATE__:
+            raise ValueError("Runner should only be initialized through `new_run` or `resume_from_checkpoint`.")
+
+        self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
+
+        self._cfg = config
+        self._optimizer_config = optimizer_config
+        self._model = model
+        self._optimizer = optimizer
+        self._pose_adjust_model = pose_adjust_model
+        self._pose_adjust_optimizer = pose_adjust_optimizer
+        self._pose_adjust_scheduler = pose_adjust_scheduler
+        self._start_step = start_step
+        self._update_viewer_every = update_viewer_every
+
+        self._sfm_scene = sfm_scene
+        self._training_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=train_indices)
+        self._validation_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
+
+        self.device = model.device
+
+        self._run_name = run_name
+        self._image_render_path = image_render_path
+        self._stats_path = stats_path
+        self._checkpoints_path = checkpoints_path
+
+        self._global_step: int = 0
+
+        # Tensorboard
+        self._tensorboard_logger = None
+        if tensorboard_path is not None and optimizer is not None and log_tensorboard_every > 0:
+            self._tensorboard_logger = TensorboardLogger(
+                log_dir=tensorboard_path,
+                log_every_step=log_tensorboard_every,
+                log_images_to_tensorboard=log_images_to_tensorboard,
+            )
+
+        # Viewer
+        # self._viewer = ViewerLogger(self.model, self._training_dataset) if not disable_viewer else None
+        self._viewer = viewer
+        if self._viewer is not None:
+            with torch.no_grad():
+                self._viewer.add_gaussian_splat_3d(f"Gaussian Scene for run {self._run_name}", self.model)
+                train_cam_poses = torch.from_numpy(self._training_dataset.camera_to_world_matrices).to(
+                    dtype=torch.float32
+                )
+                train_projection_matrices = torch.from_numpy(
+                    self._training_dataset.projection_matrices.astype(np.float32)
+                )
+                first_cam_pos = self._training_dataset.camera_to_world_matrices[0, :3, 3]
+                self._viewer.set_camera_lookat(
+                    camera_origin=first_cam_pos,
+                    lookat_point=self.model.means.mean(dim=0).cpu().numpy(),
+                    up_direction=[0, 0, -1],
+                )
+                # image_sizes = torch.from_numpy(self._training_dataset.image_sizes.astype(np.int32))
+                # self._viewer.add_camera_view(
+                #     name=f"Training Cameras for run {self._run_name}",
+                #     cam_to_world_matrices=train_cam_poses,
+                #     projection_matrices=train_projection_matrices,
+                #     image_sizes=image_sizes,
+                # )
+        # Losses & Metrics.
+        if self.config.lpips_net == "alex":
+            self._lpips = LPIPSLoss(backbone="alex").to(model.device)
+        elif self.config.lpips_net == "vgg":
+            # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
+            self._lpips = LPIPSLoss(backbone="vgg").to(model.device)
+        else:
+            raise ValueError(f"Unknown LPIPS network: {self.config.lpips_net}")
 
     def _save_statistics(self, step: int, stage: str, stats: dict) -> None:
         """
@@ -335,11 +695,57 @@ class SceneOptimizationRunner:
             (canvas * 255).astype(np.uint8),
         )
 
-    @staticmethod
+    @torch.no_grad()
+    def _save_checkpoint(self, checkpoint_path: pathlib.Path) -> None:
+        """
+        Save the current state of the training run to a checkpoint file.
+
+        Args:
+            checkpoint_path (pathlib.Path): The path to save the checkpoint file to.
+        """
+        if self._checkpoints_path is None:
+            raise RuntimeError("No checkpoints path specified, cannot save checkpoint.")
+        self._logger.info(f"Saving checkpoint at step {self._global_step} to path {checkpoint_path}")
+        checkpoint = {
+            "magic": "GaussianSplattingCheckpoint",
+            "version": self.version,
+            "step": self._global_step,
+            "run_name": self._run_name,
+            "results_path": str(self._stats_path.parent.parent) if self._stats_path is not None else None,
+            "splats": self._model.state_dict(),
+            "sfm_scene": self._sfm_scene.state_dict(),
+            "config": vars(self.config),
+            "optimizer_config": vars(self._optimizer_config),
+            "train_indices": self._training_dataset.indices,
+            "val_indices": self._validation_dataset.indices,
+            "optimizer": self._optimizer.state_dict(),
+            "num_training_poses": self._pose_adjust_model.num_poses if self._pose_adjust_model else None,
+            "pose_adjust_model": self._pose_adjust_model.state_dict() if self._pose_adjust_model else None,
+            "pose_adjust_optimizer": self._pose_adjust_optimizer.state_dict() if self._pose_adjust_optimizer else None,
+            "pose_adjust_scheduler": self._pose_adjust_scheduler.state_dict() if self._pose_adjust_scheduler else None,
+        }
+        torch.save(checkpoint, checkpoint_path)
+
+    @torch.no_grad()
+    def _save_checkpoint_and_ply(self, ckpt_path: pathlib.Path, ply_path: pathlib.Path):
+        """
+        Saves a checkpoint and a PLY file to disk
+        """
+        if self._checkpoints_path is None:
+            return
+
+        self._save_checkpoint(ckpt_path)
+
+        self.model.save_ply(
+            ply_path,
+            metadata=self._splat_ply_metadata(),
+        )
+
+    @classmethod
     def _make_or_get_results_directories(
+        cls,
         run_name: str | None,
-        save_results: bool,
-        results_base_path: pathlib.Path,
+        results_base_path: pathlib.Path | None,
         save_eval_images: bool,
         exists_ok: bool = True,
     ) -> tuple[str, pathlib.Path | None, pathlib.Path | None, pathlib.Path | None, pathlib.Path | None]:
@@ -348,7 +754,6 @@ class SceneOptimizationRunner:
 
         Args:
             run_name (str | None): The name of the run. If None, a unique name will be generated.
-            save_results (bool): Whether to save results to disk.
             results_base_path (pathlib.Path): The base path where results will be saved.
             save_eval_images (bool): Whether to save evaluation images during training.
             exists_ok (bool): If True, will not raise an error if the run name already exists.
@@ -360,10 +765,10 @@ class SceneOptimizationRunner:
             checkpoints_path (pathlib.Path): Path to save model checkpoints.
             tensorboard_path (pathlib.Path): Path to save TensorBoard logs.
         """
-        logger = logging.getLogger(f"{__name__}.SceneOptimizationRunner")
+        logger = logging.getLogger(f"{cls.__module__}.{cls.__name__}")
 
-        if not save_results:
-            logger.info("No results will be saved. You can set `save_results=True` to save the training run.")
+        if results_base_path is None:
+            logger.info("No results will be saved. You can set `results_path` to save the training run.")
             # If no results are saved and you didn't pass a run name, we'll generate a unique one
             if run_name is None:
                 run_name = str(uuid.uuid4())
@@ -407,32 +812,8 @@ class SceneOptimizationRunner:
 
         return run_name, eval_render_path, stats_path, checkpoints_path, tensorboard_path
 
-    @property
-    def checkpoint(self):
-        """
-        Return a Checkpoint object containing the current training state.
-
-        This includes the model, optimizer, configuration, pose adjustment model, and datasets.
-
-        Returns:
-            Checkpoint: A Checkpoint object containing the current training state.
-        """
-        return Checkpoint(
-            step=self._global_step,
-            run_name=self.run_name,
-            model=self.model,
-            dataset_transform=self._dataset_transform,
-            dataset_path=self._dataset_path,
-            dataset_splits={"train": self._training_dataset.indices, "val": self._validation_dataset.indices},
-            optimizer=self.optimizer,
-            config=vars(self.config),
-            pose_adjust_model=self.pose_adjust_model,
-            pose_adjust_optimizer=self.pose_adjust_optimizer,
-            pose_adjust_scheduler=self.pose_adjust_scheduler,
-        )
-
     @torch.no_grad()
-    def _splat_metadata(self) -> dict[str, torch.Tensor | float | int | str]:
+    def _splat_ply_metadata(self) -> dict[str, torch.Tensor | float | int | str]:
         training_camera_to_world_matrices = torch.from_numpy(self._training_dataset.camera_to_world_matrices).to(
             dtype=torch.float32, device=self.device
         )
@@ -462,23 +843,8 @@ class SceneOptimizationRunner:
             "tile_size": self.config.tile_size,
         }
 
-    @torch.no_grad()
-    def _save_checkpoint_and_ply(self, ckpt_path: pathlib.Path, ply_path: pathlib.Path):
-        """
-        Saves a checkpoint and a PLY file to disk
-        """
-        if self._checkpoints_path is None:
-            return
-
-        self.checkpoint.save(ckpt_path)
-
-        self.model.save_ply(
-            ply_path,
-            metadata=self._splat_metadata(),
-        )
-
     @property
-    def config(self) -> Config:
+    def config(self) -> SceneOptimizationConfig:
         """
         Get the configuration object for the current training run.
 
@@ -597,9 +963,21 @@ class SceneOptimizationRunner:
         """
         return self._checkpoints_path
 
+    @property
+    def results_path(self) -> pathlib.Path | None:
+        """
+        Get the base path where all results (stats, renders, checkpoints, tensorboard logs) are saved.
+
+        Returns:
+            pathlib.Path | None: The base results path, or None if not set.
+        """
+        if self._stats_path is not None:
+            return self._stats_path.parent
+        return None
+
     @staticmethod
     def _init_model(
-        config: Config,
+        config: SceneOptimizationConfig,
         device: torch.device | str,
         training_dataset: SfmDataset,
     ):
@@ -687,93 +1065,18 @@ class SceneOptimizationRunner:
             return np.max(dists)
 
     @staticmethod
-    def new_run(
-        dataset_path: str | pathlib.Path,
-        config: Config = Config(),
-        run_name: str | None = None,
-        image_downsample_factor: int = 4,
-        points_percentile_filter: float = 0.0,
-        normalization_type: Literal["none", "pca", "ecef2enu", "similarity"] = "pca",
-        crop_bbox: tuple[float, float, float, float, float, float] | None = None,
-        crop_to_points: bool = False,
-        min_points_per_image: int = 5,
-        results_path: str | pathlib.Path = pathlib.Path("results"),
-        device: str | torch.device = "cuda",
-        use_every_n_as_val: int = 100,
-        disable_viewer: bool = False,
-        log_tensorboard_every: int = 100,
-        log_images_to_tensorboard: bool = False,
-        save_eval_images: bool = False,
-        save_results: bool = True,
-        dataset_type: Literal["colmap", "simple_directory"] = "colmap",
-    ) -> "SceneOptimizationRunner":
+    def _make_index_splits(sfm_scene: SfmScene, use_every_n_as_val: int) -> tuple[np.ndarray, np.ndarray]:
         """
-        Create a `Runner` instance for a new training run.
+        Create training and validation splits from the images in the SfmScene.
 
         Args:
-            dataset_path (str | pathlib.Path): Path to the dataset directory containing the SFM data.
-            config (Config): Configuration object containing model parameters.
-            run_name (str | None): Optional name for the run. If None, a unique name will be generated.
-                If a run with the same name already exists, an exception will be raised.
-            image_downsample_factor (int): Factor by which to downsample the images for training.
-            points_percentile_filter (float): Percentile filter to apply to the points in the dataset (in [0, 100]).
-            normalization_type (Literal["none", "pca", "ecef2enu", "similarity"]): Type of normalization to apply to the scene data.
-            crop_bbox (tuple[float, float, float, float, float, float] | None): Optional bounding box to crop the scene data.
-                In the form [x_min, y_min, z_min, x_max, y_max, z_max].
-                If None, no cropping will be applied.
-            crop_to_points (bool): Whether to crop the scene to the bounding box of the points after applying any crop_bbox.
-            min_points_per_image (int): Minimum number of points that must be visible in an image for it to be included in the dataset.
-            results_path (str | pathlib.Path): Base path where results will be saved.
-            device (str | torch.device): The device to run the model on (e.g., "cuda" or "cpu").
+            sfm_scene (SfmScene): The scene loaded from an structure-from-motion (SfM) pipeline.
             use_every_n_as_val (int): How often to use a training image as a validation image
-            disable_viewer (bool): Whether to disable the viewer for this run.
-            log_tensorboard_every (int): How often to log metrics to TensorBoard.
-            log_images_to_tensorboard (bool): Whether to log images to TensorBoard.
-            save_eval_images (bool): Whether to save evaluation images during training.
-            save_results (bool): Whether to save results to disk.
 
         Returns:
-            Runner: A `Runner` instance initialized with the specified configuration and datasets.
+            train_indices (np.ndarray): Indices of images to use for training.
+            val_indices (np.ndarray): Indices of images to use for validation.
         """
-        if isinstance(dataset_path, str):
-            dataset_path = pathlib.Path(dataset_path)
-
-        if isinstance(results_path, str):
-            results_path = pathlib.Path(results_path)
-
-        np.random.seed(config.seed)
-        random.seed(config.seed)
-        torch.manual_seed(config.seed)
-
-        logger = logging.getLogger(f"{__name__}.SceneOptimizationRunner")
-
-        # Dataset transform
-        transforms = [
-            NormalizeScene(normalization_type=normalization_type),
-            PercentileFilterPoints(
-                percentile_min=np.full((3,), points_percentile_filter),
-                percentile_max=np.full((3,), 100.0 - points_percentile_filter),
-            ),
-            DownsampleImages(
-                image_downsample_factor=image_downsample_factor,
-                rescaled_jpeg_quality=95,
-            ),
-            FilterImagesWithLowPoints(min_num_points=min_points_per_image),
-        ]
-        if crop_bbox is not None:
-            transforms.append(CropScene(crop_bbox))
-        if crop_to_points:
-            transforms.append(CropSceneToPoints(margin=0.0))
-        transform = Compose(*transforms)
-
-        if dataset_type == "colmap":
-            sfm_scene: SfmScene = SfmScene.from_colmap(dataset_path)
-        elif dataset_type == "simple_directory":
-            sfm_scene: SfmScene = SfmScene.from_simple_directory(dataset_path)
-        else:
-            raise ValueError(f"Unsupported dataset_type {dataset_type}")
-        sfm_scene = transform(sfm_scene)
-
         indices = np.arange(sfm_scene.num_images)
         if use_every_n_as_val > 0:
             mask = np.ones(len(indices), dtype=bool)
@@ -782,300 +1085,53 @@ class SceneOptimizationRunner:
             val_indices = indices[~mask]
         else:
             train_indices = indices
-            val_indices = np.array([], dtype=int)
+            val_indices = np.array([], dtype=np.int64)
+        return train_indices, val_indices
 
-        train_dataset = SfmDataset(sfm_scene, train_indices)
-        val_dataset = SfmDataset(sfm_scene, val_indices)
-
-        logger.info(
-            f"Created dataset training and test datasets with {len(train_dataset)} training images and {len(val_dataset)} test images."
-        )
-
-        # Initialize model
-        model = SceneOptimizationRunner._init_model(config, device, train_dataset)
-        logger.info(f"Model initialized with {model.num_gaussians:,} Gaussians")
-
-        # Initialize optimizer
-        scene_scale = SceneOptimizationRunner._compute_scene_scale(train_dataset.sfm_scene)
-        max_steps = config.max_epochs * len(train_dataset)
-        mean_lr_decay_exponent = 0.01 ** (1.0 / max_steps)
-        if config.optimizer_scale_3d_threshold_units == "scene_scale":
-            config.opt.deletion_scale_3d_threshold *= scene_scale * 1.1
-            config.opt.insertion_scale_3d_threshold *= scene_scale * 1.1
-        config.opt.means_lr *= scene_scale * 1.1  # Scale the means learning rate by the scene scale
-
-        optimizer = GaussianSplatOptimizer.from_model_and_config(
-            model=model,
-            config=config.opt,
-            means_lr_decay_exponent=mean_lr_decay_exponent,
-            batch_size=config.batch_size,
-        )
-
-        # Optional camera position optimizer
-        pose_adjust_optimizer = None
-        pose_adjust_model = None
-        pose_adjust_scheduler = None
-        if config.optimize_camera_poses:
-            # Module to adjust camera poses during training
-            pose_adjust_model = CameraPoseAdjustment(len(train_dataset), init_std=config.pose_opt_init_std).to(device)
-
-            # Increase learning rate for pose optimization and add gradient clipping
-            pose_adjust_optimizer = torch.optim.Adam(
-                pose_adjust_model.parameters(),
-                lr=config.pose_opt_lr * 100.0,
-                weight_decay=config.pose_opt_reg,
-            )
-
-            # Add gradient clipping
-            torch.nn.utils.clip_grad_norm_(pose_adjust_model.parameters(), max_norm=1.0)
-
-            # Add learning rate scheduler for pose optimization
-            pose_opt_start_step = int(config.pose_opt_start_epoch * len(train_dataset))
-            pose_opt_stop_step = int(config.pose_opt_stop_epoch * len(train_dataset))
-            num_pose_opt_steps = max(1, pose_opt_stop_step - pose_opt_start_step)
-            pose_adjust_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-                pose_adjust_optimizer, gamma=config.pose_opt_lr_decay ** (1.0 / num_pose_opt_steps)
-            )
-
-        # Setup output directories.
-        run_name, image_render_path, stats_path, checkpoints_path, tensorboard_path = (
-            SceneOptimizationRunner._make_or_get_results_directories(
-                run_name=run_name,
-                results_base_path=results_path,
-                save_results=save_results,
-                save_eval_images=save_eval_images,
-                exists_ok=False,
-            )
-        )
-
-        return SceneOptimizationRunner(
-            config=config,
-            dataset_path=dataset_path,
-            sfm_scene=sfm_scene,
-            dataset_transform=transform,
-            train_indices=train_indices,
-            val_indices=val_indices,
-            model=model,
-            optimizer=optimizer,
-            pose_adjust_model=pose_adjust_model,
-            pose_adjust_optimizer=pose_adjust_optimizer,
-            pose_adjust_scheduler=pose_adjust_scheduler,
-            start_step=0,
-            run_name=run_name,
-            image_render_path=image_render_path,
-            stats_path=stats_path,
-            checkpoints_path=checkpoints_path,
-            tensorboard_path=tensorboard_path,
-            log_tensorboard_every=log_tensorboard_every,
-            log_images_to_tensorboard=log_images_to_tensorboard,
-            disable_viewer=disable_viewer,
-            _private=SceneOptimizationRunner.__PRIVATE__,
-        )
-
-    @staticmethod
-    def from_checkpoint(
-        checkpoint: Checkpoint,
-        results_path: pathlib.Path | str = pathlib.Path("results"),
-        disable_viewer: bool = False,
-        log_tensorboard_every: int = 100,
-        log_images_to_tensorboard: bool = False,
-        save_eval_images: bool = False,
-        save_results: bool = True,
-    ) -> "SceneOptimizationRunner":
+    @classmethod
+    def _make_pose_optimizer(
+        cls, optimization_config: SceneOptimizationConfig, device: torch.device | str, num_images: int
+    ) -> tuple[CameraPoseAdjustment, torch.optim.Adam, torch.optim.lr_scheduler.ExponentialLR]:
         """
-        Create a `Runner` instance from a saved checkpoint.
+        Create a camera pose adjustment model, optimizer, and scheduler if camera pose optimization is enabled in the config.
 
         Args:
-            checkpoint (Checkpoint): The checkpoint to load from.
-            results_path (pathlib.Path | str): Base path where results will be saved.
-            disable_viewer (bool): Whether to disable the viewer for this run.
-            log_tensorboard_every (int): How often to log metrics to TensorBoard.
-            log_images_to_tensorboard (bool): Whether to log images to TensorBoard.
-            save_results (bool): Whether to save results to disk.
-            save_eval_images (bool): Whether to save evaluation images during training.
+            optimization_config (Config): Configuration object containing optimization parameters.
+            device (torch.device | str): The device to run the model on (e.g., "cuda" or "cpu").
+            num_images (int): The number of images in the dataset.
+
+        Returns:
+            pose_adjust_model (CameraPoseAdjustment | None):
+                The camera pose adjustment model, or None if not used.
+            pose_adjust_optimizer (torch.optim.Adam | None):
+                The optimizer for the pose adjustment model, or None if not used.
+            pose_adjust_scheduler (torch.optim.lr_scheduler.ExponentialLR | None):
+                The learning rate scheduler for the pose adjustment optimizer, or None if not used.
         """
-        if isinstance(results_path, str):
-            results_path = pathlib.Path(results_path)
+        if not optimization_config.optimize_camera_poses:
+            raise ValueError("Camera pose optimization is not enabled in the config.")
 
-        logger = logging.getLogger(f"{__name__}.SceneOptimizationRunner")
-        config = Config(**checkpoint.config)
+        # Module to adjust camera poses during training
+        pose_adjust_model = CameraPoseAdjustment(num_images, init_std=optimization_config.pose_opt_init_std).to(device)
 
-        np.random.seed(config.seed)
-        random.seed(config.seed)
-        torch.manual_seed(config.seed)
-
-        if not checkpoint.dataset_path.exists():
-            raise FileNotFoundError(f"Checkpoint dataset path {checkpoint.dataset_path} does not exist.")
-
-        sfm_scene: SfmScene = SfmScene.from_colmap(checkpoint.dataset_path)
-        sfm_scene = checkpoint.dataset_transform(sfm_scene)
-
-        if "train" not in checkpoint.dataset_splits:
-            raise ValueError("Checkpoint does not have 'train' split")
-        if "val" not in checkpoint.dataset_splits:
-            raise ValueError("Checkpoint does not have 'val' split")
-
-        train_indices = checkpoint.dataset_splits["train"]
-        val_indices = checkpoint.dataset_splits["val"]
-
-        logger.info(f"Loaded checkpoint with {checkpoint.splats.num_gaussians:,} Gaussians.")
-
-        # Setup output directories.
-        run_name, image_render_path, stats_path, checkpoints_path, tensorboard_path = (
-            SceneOptimizationRunner._make_or_get_results_directories(
-                run_name=checkpoint.run_name,
-                save_results=save_results,
-                results_base_path=results_path,
-                save_eval_images=save_eval_images,
-            )
+        # Increase learning rate for pose optimization and add gradient clipping
+        pose_adjust_optimizer = torch.optim.Adam(
+            pose_adjust_model.parameters(),
+            lr=optimization_config.pose_opt_lr * 100.0,
+            weight_decay=optimization_config.pose_opt_reg,
         )
 
-        return SceneOptimizationRunner(
-            config=config,
-            dataset_path=checkpoint.dataset_path,
-            sfm_scene=sfm_scene,
-            dataset_transform=checkpoint.dataset_transform,
-            train_indices=train_indices,
-            val_indices=val_indices,
-            model=checkpoint.splats,
-            optimizer=checkpoint.optimizer,
-            pose_adjust_model=checkpoint.pose_adjust_model,
-            pose_adjust_optimizer=checkpoint.pose_adjust_optimizer,
-            pose_adjust_scheduler=checkpoint.pose_adjust_scheduler,
-            start_step=checkpoint.step,
-            run_name=run_name,
-            image_render_path=image_render_path,
-            stats_path=stats_path,
-            checkpoints_path=checkpoints_path,
-            tensorboard_path=tensorboard_path,
-            log_tensorboard_every=log_tensorboard_every,
-            log_images_to_tensorboard=log_images_to_tensorboard,
-            disable_viewer=disable_viewer,
-            _private=SceneOptimizationRunner.__PRIVATE__,
+        # Add gradient clipping
+        torch.nn.utils.clip_grad_norm_(pose_adjust_model.parameters(), max_norm=1.0)
+
+        # Add learning rate scheduler for pose optimization
+        pose_opt_start_step = int(optimization_config.pose_opt_start_epoch * num_images)
+        pose_opt_stop_step = int(optimization_config.pose_opt_stop_epoch * num_images)
+        num_pose_opt_steps = max(1, pose_opt_stop_step - pose_opt_start_step)
+        pose_adjust_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            pose_adjust_optimizer, gamma=optimization_config.pose_opt_lr_decay ** (1.0 / num_pose_opt_steps)
         )
-
-    def __init__(
-        self,
-        config: Config,
-        dataset_path: pathlib.Path,
-        sfm_scene: SfmScene,
-        dataset_transform: BaseTransform,
-        train_indices: np.ndarray,
-        val_indices: np.ndarray,
-        model: GaussianSplat3d,
-        optimizer: GaussianSplatOptimizer,
-        pose_adjust_model: CameraPoseAdjustment | None,
-        pose_adjust_optimizer: torch.optim.Adam | None,
-        pose_adjust_scheduler: torch.optim.lr_scheduler.ExponentialLR | None,
-        start_step: int,
-        run_name: str,
-        image_render_path: pathlib.Path | None,
-        stats_path: pathlib.Path | None,
-        checkpoints_path: pathlib.Path | None,
-        tensorboard_path: pathlib.Path | None,
-        log_tensorboard_every: int,
-        log_images_to_tensorboard: bool,
-        disable_viewer: bool,
-        _private: object | None = None,
-    ) -> None:
-        """
-        Initialize the Runner with the provided configuration, model, optimizer, datasets, and paths.
-
-        Note: This constructor should only be called by the `new_run` or `resume_from_checkpoint` methods.
-
-        Args:
-            config (Config): Configuration object containing model parameters.
-            sfm_scene (SfmScene): The Structure-from-Motion scene.
-            dataset_transform (BaseTransform): The transform used to normalize/scale/resample the SfmScene.
-            train_indices (np.ndarray): The indices for the training set.
-            val_indices (np.ndarray): The indices for the validation set.
-            model (GaussianSplat3d): The Gaussian Splatting model to train.
-            optimizer (GaussianSplatOptimizer | None): The optimizer for the model if training.
-                Note: You can pass in a None optimizer if you want to use the model only for evaluation.
-            pose_adjust_model (CameraPoseAdjustment | None): The camera pose adjustment model, if used
-            pose_adjust_optimizer (torch.optim.Adam | None): The optimizer for camera pose adjustment, if used.
-            pose_adjust_scheduler (torch.optim.lr_scheduler.ExponentialLR | None): The learning rate scheduler
-                for camera pose adjustment, if used.
-            start_step (int): The step to start training from (useful for resuming training
-                from a checkpoint).
-            run_name (str | None): The name of the training run or None for an un-named run.
-            image_render_path (pathlib.Path | None): Path to save rendered images during evaluation.
-            stats_path (pathlib.Path | None): Path to save training statistics
-            checkpoints_path (pathlib.Path | None): Path to save model checkpoints.
-            tensorboard_path (pathlib.Path | None): Path to save TensorBoard logs.
-            log_tensorboard_every (int): How often to log metrics to TensorBoard.
-            log_images_to_tensorboard (bool): Whether to log images to TensorBoard.
-            disable_viewer (bool): Whether to disable the viewer for this run.
-            _private (object | None): Private object to ensure this class is only initialized through `new_run` or `resume_from_checkpoint`.
-        """
-        if _private is not SceneOptimizationRunner.__PRIVATE__:
-            raise ValueError("Runner should only be initialized through `new_run` or `resume_from_checkpoint`.")
-
-        self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
-
-        self._cfg = config
-        self._model = model
-        self._optimizer = optimizer
-        self._pose_adjust_model = pose_adjust_model
-        self._pose_adjust_optimizer = pose_adjust_optimizer
-        self._pose_adjust_scheduler = pose_adjust_scheduler
-        self._start_step = start_step
-
-        self._sfm_scene = sfm_scene
-        self._dataset_transform = dataset_transform
-        self._dataset_path = dataset_path
-        self._training_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=train_indices)
-        self._validation_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
-
-        self.device = model.device
-
-        self._run_name = run_name
-        self._image_render_path = image_render_path
-        self._stats_path = stats_path
-        self._checkpoints_path = checkpoints_path
-
-        self._global_step: int = 0
-
-        # Tensorboard
-        self._tensorboard_logger = None
-        if tensorboard_path is not None and optimizer is not None and log_tensorboard_every > 0:
-            self._tensorboard_logger = TensorboardLogger(
-                log_dir=tensorboard_path,
-                log_every_step=log_tensorboard_every,
-                log_images_to_tensorboard=log_images_to_tensorboard,
-            )
-
-        # Viewer
-        # self._viewer = ViewerLogger(self.model, self._training_dataset) if not disable_viewer else None
-        self._viewer = Viewer(ip_address="127.0.0.1", port=8888, verbose=False) if not disable_viewer else None
-        if self._viewer is not None:
-            with torch.no_grad():
-                self._viewer.add_gaussian_splat_3d("Gaussian Scene", self.model)
-                train_cam_poses = torch.from_numpy(self._training_dataset.camera_to_world_matrices).to(
-                    dtype=torch.float32
-                )
-                train_projection_matrices = torch.from_numpy(
-                    self._training_dataset.projection_matrices.astype(np.float32)
-                )
-                first_cam_pos = self._training_dataset.camera_to_world_matrices[0, :3, 3]
-                self._viewer.set_camera_lookat(
-                    camera_origin=first_cam_pos,
-                    lookat_point=self.model.means.mean(dim=0).cpu().numpy(),
-                    up_direction=[0, 0, -1],
-                )
-                # self._viewer.add_camera_view(
-                #     name="Training Cameras",
-                #     camera_to_world_matrices=train_cam_poses,
-                #     projection_matrices=train_projection_matrices,
-                # )
-        # Losses & Metrics.
-        if self.config.lpips_net == "alex":
-            self._lpips = LPIPSLoss(backbone="alex").to(model.device)
-        elif self.config.lpips_net == "vgg":
-            # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
-            self._lpips = LPIPSLoss(backbone="vgg").to(model.device)
-        else:
-            raise ValueError(f"Unknown LPIPS network: {self.config.lpips_net}")
+        return pose_adjust_model, pose_adjust_optimizer, pose_adjust_scheduler
 
     def train(self) -> tuple[GaussianSplat3d, dict[str, torch.Tensor | float | int | str]]:
         """
@@ -1130,7 +1186,7 @@ class SceneOptimizationRunner:
         pose_opt_start_step: int = int(self.config.pose_opt_start_epoch * len(self.training_dataset))
         pose_opt_stop_step: int = int(self.config.pose_opt_stop_epoch * len(self.training_dataset))
 
-        update_viewer_every_step = int(self.config.update_viewer_every_epochs * len(self.training_dataset))
+        update_viewer_every_step = int(self._update_viewer_every * len(self.training_dataset))
 
         # Progress bar to track training progress
         if self.config.max_steps is not None:
@@ -1199,7 +1255,7 @@ class SceneOptimizationRunner:
                 )
 
                 # If you have very large images, you can iterate over disjoint crops and accumulate gradients
-                # If cfg.crops_per_image is 1, then this just returns the image
+                # If self.optimization_config.crops_per_image is 1, then this just returns the image
                 for pixels, mask_pixels, crop, is_last in crop_image_batch(image, mask, self.config.crops_per_image):
                     # Actual pixels to compute the loss on, normalized to [0, 1]
                     pixels = pixels.to(self.device) / 255.0  # [1, H, W, 3]
@@ -1208,7 +1264,12 @@ class SceneOptimizationRunner:
                     # possibly using a crop of the full image
                     crop_origin_w, crop_origin_h, crop_w, crop_h = crop
                     colors, alphas = self.model.render_from_projected_gaussians(
-                        projected_gaussians, crop_w, crop_h, crop_origin_w, crop_origin_h, self.config.tile_size
+                        projected_gaussians,
+                        crop_w,
+                        crop_h,
+                        crop_origin_w,
+                        crop_origin_h,
+                        self.config.tile_size,
                     )
                     # If you want to add random background, we'll mix it in here
                     if self.config.random_bkgd:
@@ -1406,7 +1467,7 @@ class SceneOptimizationRunner:
         else:
             self._logger.info("Training completed. No checkpoints path specified, not saving final checkpoint.")
 
-        return self._model, self._splat_metadata()
+        return self._model, self._splat_ply_metadata()
 
     @torch.no_grad()
     def eval(self, stage: str = "val"):

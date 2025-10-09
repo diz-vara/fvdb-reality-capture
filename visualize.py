@@ -58,14 +58,19 @@ def main(
     viewer.set_camera_lookat(
         camera_origin=initial_camera_position,
         lookat_point=scene_centroid,
-        up_direction=[0, 0, 1],
+        up_direction=[0, 0, -1],
     )
 
     if has_camera_to_world_matrices and has_projection_matrices:
         assert isinstance(metadata["camera_to_world_matrices"], torch.Tensor)
         assert isinstance(metadata["projection_matrices"], torch.Tensor)
+        image_sizes = metadata.get("image_sizes", None)
+        assert isinstance(image_sizes, torch.Tensor)
         viewer.add_camera_view(
-            "training cameras", metadata["camera_to_world_matrices"].cpu(), metadata["projection_matrices"].cpu()
+            "training cameras",
+            metadata["camera_to_world_matrices"].cpu(),
+            metadata["projection_matrices"].cpu(),
+            image_sizes,
         )
     else:
         logger.info("No camera information found in PLY metadata, not adding camera views to viewer")
