@@ -17,8 +17,8 @@ from fvdb import GaussianSplat3d
 
 from fvdb_reality_capture.sfm_scene import SfmScene
 from fvdb_reality_capture.training import (
+    GaussianSplatReconstruction,
     SceneOptimizationConfig,
-    SceneOptimizationRunner,
     SfmDataset,
 )
 from fvdb_reality_capture.transforms import (
@@ -69,7 +69,7 @@ def _run_on_chunk(
     chunk_id: int,
     chunk_bboxes: Sequence[tuple[float, float, float, float, float, float]],
     dataset_path: pathlib.Path,
-    cfg: SceneOptimizationConfig,
+    cfg: GaussianSplatReconstruction,
     chunk_run_name_prefix: str,
     image_downsample_factor: int,
     points_percentile_filter: float,
@@ -84,7 +84,7 @@ def _run_on_chunk(
 ):
     """
     Train a 3D Gaussian Splatting model on a specific chunk of the dataset.
-    This function initializes a SceneOptimizationRunner for the specified chunk,
+    This function initializes a GaussianSplatReconstruction for the specified chunk,
     sets up the training configuration, and starts the training process.
 
     Args:
@@ -106,7 +106,7 @@ def _run_on_chunk(
         save_results (bool): Whether to save the results of the training.
         save_eval_images (bool): Whether to save evaluation images during training.
     """
-    runner = SceneOptimizationRunner.new_run(
+    runner = GaussianSplatReconstruction.new_run(
         config=cfg,
         dataset_path=dataset_path,
         run_name=chunk_run_name_prefix + f"_chunk_{chunk_id:04d}",

@@ -15,8 +15,8 @@ from fvdb.viz import Viewer
 from fvdb_reality_capture import SfmScene
 from fvdb_reality_capture.training import (
     GaussianSplatOptimizerConfig,
+    GaussianSplatReconstruction,
     SceneOptimizationConfig,
-    SceneOptimizationRunner,
 )
 from fvdb_reality_capture.transforms import (
     Compose,
@@ -107,7 +107,7 @@ def main(
     else:
         viewer = None
 
-    runner = SceneOptimizationRunner.from_sfm_scene(
+    runner = GaussianSplatReconstruction.from_sfm_scene(
         tx.scene_transform(sfm_scene),
         config=cfg,
         optimizer_config=opt,

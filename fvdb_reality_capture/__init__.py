@@ -7,8 +7,8 @@ from .sfm_scene import SfmCache, SfmCameraMetadata, SfmImageMetadata, SfmScene
 from .tools import download_example_data
 from .training import (
     GaussianSplatOptimizerConfig,
+    GaussianSplatReconstruction,
     SceneOptimizationConfig,
-    SceneOptimizationRunner,
 )
 
 __all__ = [
@@ -18,7 +18,7 @@ __all__ = [
     "training",
     "SceneOptimizationConfig",
     "GaussianSplatOptimizerConfig",
-    "SceneOptimizationRunner",
+    "GaussianSplatReconstruction",
     "transforms",
     "viewer",
     "download_example_data",

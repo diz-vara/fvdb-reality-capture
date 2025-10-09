@@ -7,7 +7,7 @@ import pathlib
 import torch
 import tyro
 
-from fvdb_reality_capture.training import Checkpoint, SceneOptimizationRunner
+from fvdb_reality_capture.training import Checkpoint, GaussianSplatReconstruction
 
 
 def main(
@@ -36,7 +36,7 @@ def main(
 
     # The runner will create a visualization for us so we'll just create one pause while the
     # viewer is running.
-    runner = SceneOptimizationRunner.from_checkpoint(
+    runner = GaussianSplatReconstruction.from_checkpoint(
         checkpoint=checkpoint,
         results_path=pathlib.Path("results"),
         disable_viewer=True,

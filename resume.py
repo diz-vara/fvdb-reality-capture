@@ -8,7 +8,7 @@ import time
 import torch
 import tyro
 
-from fvdb_reality_capture.training import SceneOptimizationRunner
+from fvdb_reality_capture.training import GaussianSplatReconstruction
 
 
 def main(
@@ -22,7 +22,7 @@ def main(
 ):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s : %(message)s")
 
-    runner = SceneOptimizationRunner.from_checkpoint(
+    runner = GaussianSplatReconstruction.from_checkpoint(
         checkpoint_path=checkpoint_path,
         override_results_path=override_results_path,
         log_tensorboard_every=log_tensorboard_every,

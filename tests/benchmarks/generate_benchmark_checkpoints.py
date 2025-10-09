@@ -17,8 +17,8 @@ import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent.resolve()))
 from fvdb_reality_capture.training import (
+    GaussianSplatReconstruction,
     SceneOptimizationConfig,
-    SceneOptimizationRunner,
 )
 
 logger = logging.getLogger("train benchmark checkpoints")
@@ -135,7 +135,7 @@ def main(
 
             # Create the runner (this sets up datasets/transforms/cache) without including it in training time
             logger.info(f"Preparing training run for {dataset_name} (initializing datasets/transforms/cache)...")
-            runner = SceneOptimizationRunner.new_run(
+            runner = GaussianSplatReconstruction.new_run(
                 config=base_config,
                 dataset_path=dataset_path,
                 run_name=run_name,

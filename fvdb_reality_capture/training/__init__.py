@@ -7,11 +7,14 @@ from .gaussian_splat_optimizer import (
     GaussianSplatOptimizerConfig,
     InsertionGrad2dThresholdMode,
 )
-from .scene_optimization_runner import SceneOptimizationConfig, SceneOptimizationRunner
+from .scene_optimization_runner import (
+    GaussianSplatReconstruction,
+    SceneOptimizationConfig,
+)
 from .sfm_dataset import SfmDataset
 
 __all__ = [
-    "SceneOptimizationRunner",
+    "GaussianSplatReconstruction",
     "SceneOptimizationConfig",
     "SfmDataset",
     "GaussianSplatOptimizer",

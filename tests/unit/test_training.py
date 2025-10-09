@@ -10,7 +10,7 @@ import numpy as np
 import fvdb_reality_capture as frc
 
 
-class SceneOptimizationRunnerTests(unittest.TestCase):
+class GaussianSplatReconstructionTests(unittest.TestCase):
     def setUp(self):
         # Auto-download this dataset if it doesn't exist.
         self.dataset_path = pathlib.Path(__file__).parent.parent.parent / "data" / "360_v2" / "counter"
@@ -33,7 +33,7 @@ class SceneOptimizationRunnerTests(unittest.TestCase):
             eval_at_percent=[],
         )
 
-        runner = frc.SceneOptimizationRunner.from_sfm_scene(
+        runner = frc.GaussianSplatReconstruction.from_sfm_scene(
             self.sfm_scene,
             config=short_config,
             use_every_n_as_val=2,
@@ -56,7 +56,7 @@ class SceneOptimizationRunnerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             results_path = pathlib.Path(tmpdirname)
-            runner = frc.SceneOptimizationRunner.from_sfm_scene(
+            runner = frc.GaussianSplatReconstruction.from_sfm_scene(
                 self.sfm_scene,
                 config=short_config,
                 use_every_n_as_val=2,
@@ -101,7 +101,7 @@ class SceneOptimizationRunnerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             results_path = pathlib.Path(tmpdirname)
-            runner = frc.SceneOptimizationRunner.from_sfm_scene(
+            runner = frc.GaussianSplatReconstruction.from_sfm_scene(
                 self.sfm_scene,
                 config=short_config,
                 use_every_n_as_val=2,
@@ -161,7 +161,7 @@ class SceneOptimizationRunnerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             results_path = pathlib.Path(tmpdirname)
-            runner = frc.SceneOptimizationRunner.from_sfm_scene(
+            runner = frc.GaussianSplatReconstruction.from_sfm_scene(
                 self.sfm_scene,
                 config=short_config,
                 use_every_n_as_val=2,
@@ -220,7 +220,9 @@ class SceneOptimizationRunnerTests(unittest.TestCase):
             self.assertEqual(num_ckpt_files, 2)  # 1 ply + 1 checkpoint per save + 2 symlinks
 
             # Now try to load the checkpoint
-            runner2 = frc.SceneOptimizationRunner.from_checkpoint(lowest_checkpoint_path, device=runner.model.device)
+            runner2 = frc.GaussianSplatReconstruction.from_checkpoint(
+                lowest_checkpoint_path, device=runner.model.device
+            )
 
             assert runner2.checkpoints_path is not None
             assert runner2.stats_path is not None

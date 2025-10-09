@@ -227,7 +227,7 @@ class TensorboardLogger:
         self._tb_writer.add_scalar("eval/num_gaussians", num_gaussians, step)
 
 
-class SceneOptimizationRunner:
+class GaussianSplatReconstruction:
     """Engine for training and testing."""
 
     version = "0.1.0"
@@ -269,11 +269,11 @@ class SceneOptimizationRunner:
         )
 
         # Initialize model
-        model = SceneOptimizationRunner._init_model(config, device, train_dataset)
+        model = GaussianSplatReconstruction._init_model(config, device, train_dataset)
         logger.info(f"Model initialized with {model.num_gaussians:,} Gaussians")
 
         # Initialize optimizer
-        scene_scale = SceneOptimizationRunner._compute_scene_scale(train_dataset.sfm_scene)
+        scene_scale = GaussianSplatReconstruction._compute_scene_scale(train_dataset.sfm_scene)
         max_steps = config.max_epochs * len(train_dataset)
         mean_lr_decay_exponent = 0.01 ** (1.0 / max_steps)
         # Copy the optimizer config so we don't modify the input config
@@ -298,7 +298,7 @@ class SceneOptimizationRunner:
 
         # Setup output directories.
         run_name, image_render_path, stats_path, checkpoints_path, tensorboard_path = (
-            SceneOptimizationRunner._make_or_get_results_directories(
+            GaussianSplatReconstruction._make_or_get_results_directories(
                 run_name=run_name,
                 results_base_path=results_path,
                 save_eval_images=save_eval_images,
@@ -306,7 +306,7 @@ class SceneOptimizationRunner:
             )
         )
 
-        return SceneOptimizationRunner(
+        return GaussianSplatReconstruction(
             config=config,
             optimizer_config=optimizer_config,
             sfm_scene=sfm_scene,
@@ -327,7 +327,7 @@ class SceneOptimizationRunner:
             log_images_to_tensorboard=log_tensorboard_every > 0,
             viewer=viewer,
             update_viewer_every=update_viewer_every,
-            _private=SceneOptimizationRunner.__PRIVATE__,
+            _private=GaussianSplatReconstruction.__PRIVATE__,
         )
 
     @classmethod
@@ -343,7 +343,7 @@ class SceneOptimizationRunner:
         log_images_to_tensorboard: bool = False,
         save_eval_images: bool = False,
         device: str | torch.device = "cuda",
-    ) -> "SceneOptimizationRunner":
+    ) -> "GaussianSplatReconstruction":
         """
         Create a `Runner` instance from a saved checkpoint.
 
@@ -487,7 +487,7 @@ class SceneOptimizationRunner:
 
         # Setup output directories.
         run_name, image_render_path, stats_path, checkpoints_path, tensorboard_path = (
-            SceneOptimizationRunner._make_or_get_results_directories(
+            GaussianSplatReconstruction._make_or_get_results_directories(
                 run_name=run_name,
                 results_base_path=results_path,
                 save_eval_images=save_eval_images,
@@ -498,7 +498,7 @@ class SceneOptimizationRunner:
         random.seed(optimization_config.seed)
         torch.manual_seed(optimization_config.seed)
 
-        return SceneOptimizationRunner(
+        return GaussianSplatReconstruction(
             config=optimization_config,
             sfm_scene=sfm_scene,
             optimizer_config=optimizer_config,
@@ -519,7 +519,7 @@ class SceneOptimizationRunner:
             log_images_to_tensorboard=log_images_to_tensorboard,
             viewer=viewer,
             update_viewer_every=update_viewer_every,
-            _private=SceneOptimizationRunner.__PRIVATE__,
+            _private=GaussianSplatReconstruction.__PRIVATE__,
         )
 
     def __init__(
@@ -576,7 +576,7 @@ class SceneOptimizationRunner:
             update_viewer_every (int): How often to update the viewer with new training information.
             _private (object | None): Private object to ensure this class is only initialized through `new_run` or `resume_from_checkpoint`.
         """
-        if _private is not SceneOptimizationRunner.__PRIVATE__:
+        if _private is not GaussianSplatReconstruction.__PRIVATE__:
             raise ValueError("Runner should only be initialized through `new_run` or `resume_from_checkpoint`.")
 
         self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
@@ -834,7 +834,7 @@ class SceneOptimizationRunner:
             "camera_to_world_matrices": training_camera_to_world_matrices,
             "projection_matrices": training_projection_matrices,
             "image_sizes": training_image_sizes,
-            "scene_scale": SceneOptimizationRunner._compute_scene_scale(self.training_dataset.sfm_scene),
+            "scene_scale": GaussianSplatReconstruction._compute_scene_scale(self.training_dataset.sfm_scene),
             "eps2d": self.config.eps_2d,
             "near_plane": self.config.near_plane,
             "far_plane": self.config.far_plane,
