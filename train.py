@@ -82,9 +82,10 @@ def main(
     run_name: str | None = None,
     results_path: pathlib.Path = pathlib.Path("results"),
     device: str | torch.device = "cuda",
+    tensorboard_path: pathlib.Path | None = None,
     use_every_n_as_val: int = -1,
     visualize_every: int = -1,
-    log_tensorboard_every: int = -1,
+    log_tensorboard_every: int = 10,
     save_results: bool = True,
     save_eval_images: bool = False,
     verbose: bool = False,
@@ -115,10 +116,11 @@ def main(
         results_path=results_path if save_results else None,
         device=device,
         use_every_n_as_val=use_every_n_as_val,
-        log_tensorboard_every=log_tensorboard_every,
         save_eval_images=save_eval_images,
+        tensorboard_path=tensorboard_path,
+        tensorboard_log_interval_steps=log_tensorboard_every,
         viewer=viewer,
-        update_viewer_every=visualize_every,
+        viewer_update_interval_epochs=visualize_every,
     )
 
     runner.train()

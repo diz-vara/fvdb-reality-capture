@@ -137,96 +137,6 @@ class SceneOptimizationConfig:
     tile_size: int = 16
 
 
-class TensorboardLogger:
-    """
-    A utility class to log training metrics to TensorBoard.
-    """
-
-    def __init__(self, log_dir: pathlib.Path, log_every_step: int = 100, log_images_to_tensorboard: bool = False):
-        """
-        Create a new `TensorboardLogger` instance which is used to track training and evaluation progress in tensorboard.
-
-        Args:
-            log_dir (pathlib.Path): Directory to save TensorBoard logs.
-            log_every_step (int): Log every `log_every_step` steps.
-            log_images_to_tensorboard (bool): Whether to log images to TensorBoard.
-        """
-        self._log_every_step = log_every_step
-        self._log_dir = log_dir
-        self._log_images_to_tensorboard = log_images_to_tensorboard
-        self._tb_writer = SummaryWriter(log_dir=log_dir)
-
-    def log_training_iteration(
-        self,
-        step: int,
-        num_gaussians: int,
-        loss: float,
-        l1loss: float,
-        ssimloss: float,
-        mem: float,
-        gt_img: torch.Tensor,
-        pred_img: torch.Tensor,
-        pose_loss: float | None,
-    ):
-        """
-        Log training metrics to TensorBoard.
-
-        Args:
-            step: Current training step.
-            num_gaussians: Number of Gaussians in the model.
-            loss: Total loss value.
-            l1loss: L1 loss value.
-            ssimloss: SSIM loss value.
-            mem: Maximum GPU memory allocated in GB.
-            pose_loss: Pose optimization loss, if applicable.
-            gt_img: Ground truth image for visualization.
-            pred_img: Predicted image for visualization.
-        """
-        if self._log_every_step > 0 and step % self._log_every_step == 0 and self._tb_writer is not None:
-            mem = torch.cuda.max_memory_allocated() / 1024**3
-            self._tb_writer.add_scalar("train/loss", loss, step)
-            self._tb_writer.add_scalar("train/l1loss", l1loss, step)
-            self._tb_writer.add_scalar("train/ssimloss", ssimloss, step)
-            self._tb_writer.add_scalar("train/num_gaussians", num_gaussians, step)
-            self._tb_writer.add_scalar("train/mem", mem, step)
-            # Log pose optimization metrics
-            if pose_loss is not None:
-                # Log individual components of pose parameters
-                self._tb_writer.add_scalar("train/pose_reg_loss", pose_loss, step)
-            if self._log_images_to_tensorboard:
-                canvas = torch.cat([gt_img, pred_img], dim=2).detach().cpu().numpy()
-                canvas = canvas.reshape(-1, *canvas.shape[2:])
-                self._tb_writer.add_image("train/render", canvas, step)
-            self._tb_writer.flush()
-
-    def log_evaluation_iteration(
-        self,
-        step: int,
-        psnr: float,
-        ssim: float,
-        lpips: float,
-        avg_time_per_image: float,
-        num_gaussians: int,
-    ):
-        """
-        Log evaluation metrics to TensorBoard.
-
-        Args:
-            step: The training step after which the evaluation was performed.
-            psnr: Peak Signal-to-Noise Ratio for the evaluation (averaged over all images in the validation set).
-            ssim: Structural Similarity Index Measure for the evaluation (averaged over all images in the validation set).
-            lpips: Learned Perceptual Image Patch Similarity for the evaluation (averaged over all images in the validation set).
-            avg_time_per_image: Average time taken to evaluate each image.
-            num_gaussians: Number of Gaussians in the model at this evaluation step.
-        """
-
-        self._tb_writer.add_scalar("eval/psnr", psnr, step)
-        self._tb_writer.add_scalar("eval/ssim", ssim, step)
-        self._tb_writer.add_scalar("eval/lpips", lpips, step)
-        self._tb_writer.add_scalar("eval/avg_time_per_image", avg_time_per_image, step)
-        self._tb_writer.add_scalar("eval/num_gaussians", num_gaussians, step)
-
-
 class GaussianSplatReconstruction:
     """Engine for training and testing."""
 
@@ -246,9 +156,10 @@ class GaussianSplatReconstruction:
         run_name: str | None = None,
         results_path: str | pathlib.Path | None = None,
         viewer: Viewer | None = None,
-        update_viewer_every: int = 10,
+        tensorboard_path: pathlib.Path | None = None,
+        viewer_update_interval_epochs: int = 10,
+        tensorboard_log_interval_steps: int = 10,
         device: str | torch.device = "cuda",
-        log_tensorboard_every: int = -1,
         save_eval_images: bool = False,
     ):
         if isinstance(results_path, str):
@@ -297,36 +208,29 @@ class GaussianSplatReconstruction:
             )
 
         # Setup output directories.
-        run_name, image_render_path, stats_path, checkpoints_path, tensorboard_path = (
-            GaussianSplatReconstruction._make_or_get_results_directories(
-                run_name=run_name,
-                results_base_path=results_path,
-                save_eval_images=save_eval_images,
-                exists_ok=False,
-            )
+        run_name, run_results_path = cls._make_run_directory(
+            run_name=run_name, results_base_path=results_path, exists_ok=False
         )
 
         return GaussianSplatReconstruction(
+            model=model,
+            sfm_scene=sfm_scene,
+            optimizer=optimizer,
             config=config,
             optimizer_config=optimizer_config,
-            sfm_scene=sfm_scene,
             train_indices=train_indices,
             val_indices=val_indices,
-            model=model,
-            optimizer=optimizer,
             pose_adjust_model=pose_adjust_model,
             pose_adjust_optimizer=pose_adjust_optimizer,
             pose_adjust_scheduler=pose_adjust_scheduler,
             start_step=0,
             run_name=run_name,
-            image_render_path=image_render_path,
-            stats_path=stats_path,
-            checkpoints_path=checkpoints_path,
-            tensorboard_path=tensorboard_path,
-            log_tensorboard_every=log_tensorboard_every,
-            log_images_to_tensorboard=log_tensorboard_every > 0,
+            run_results_path=run_results_path,
             viewer=viewer,
-            update_viewer_every=update_viewer_every,
+            tensorboard_path=tensorboard_path,
+            eval_logs_images=save_eval_images,
+            tensorboard_log_interval=tensorboard_log_interval_steps,
+            viewer_log_interval=viewer_update_interval_epochs,
             _private=GaussianSplatReconstruction.__PRIVATE__,
         )
 
@@ -338,35 +242,12 @@ class GaussianSplatReconstruction:
         override_use_every_n_as_val: int | None = None,
         override_results_path: pathlib.Path | str | None = None,
         viewer: Viewer | None = None,
-        update_viewer_every: int = 10,
-        log_tensorboard_every: int = -1,
-        log_images_to_tensorboard: bool = False,
+        tensorboard_path: str | pathlib.Path | None = None,
+        viewer_update_interval_epochs: int = 10,
+        tensorboard_log_interval_steps: int = 10,
         save_eval_images: bool = False,
         device: str | torch.device = "cuda",
     ) -> "GaussianSplatReconstruction":
-        """
-        Create a `Runner` instance from a saved checkpoint.
-
-        Args:
-            checkpoint_path (str | pathlib.Path): The path to the checkpoint to load from.
-            override_sfm_scene (SfmScene | None): Optional SfM scene to override the one in the checkpoint.
-                This can be used to load a checkpoint on a different SfM scene (e.g., for fine-tuning).
-                The transform stored in the checkpoint will still be applied to this scene.
-                If None, the SfM scene from the checkpoint will be used.
-            override_use_every_n_as_val (int | None): If not None, overrides the use_every_n_as_val parameter
-                from the checkpoint config to determine the train/val split.
-                This can be used to change the train/val split when resuming from a checkpoint.
-                If None, the value from the checkpoint config will be used.
-            override_results_path (pathlib.Path | str | None): A saved checkpoint will always have a results path
-                associated with it. By default, we will use that path to save new results.
-                If this parameter is set, it will override the results path from the checkpoint.
-            viewer (Viewer | None): Optional viewer instance for visualizing training progress. If None, no viewer will be used.
-            update_viewer_every (int): How often to update the viewer with the latest model state.
-            log_tensorboard_every (int): How often to log metrics to TensorBoard.
-            log_images_to_tensorboard (bool): Whether to log images to TensorBoard.
-            save_eval_images (bool): Whether to save evaluation images during training.
-            device (str | torch.device): The device to run the model on (e.g., "cuda" or "cpu").
-        """
         logger = logging.getLogger(f"{cls.__module__}.{cls.__name__}")
 
         logger.info(f"Loading checkpoint from {checkpoint_path} on device {device}")
@@ -486,64 +367,59 @@ class GaussianSplatReconstruction:
             results_path = pathlib.Path(results_path)
 
         # Setup output directories.
-        run_name, image_render_path, stats_path, checkpoints_path, tensorboard_path = (
-            GaussianSplatReconstruction._make_or_get_results_directories(
-                run_name=run_name,
-                results_base_path=results_path,
-                save_eval_images=save_eval_images,
-            )
+        run_name, run_results_path = cls._make_run_directory(
+            run_name=run_name, results_base_path=results_path, exists_ok=False
         )
 
         np.random.seed(optimization_config.seed)
         random.seed(optimization_config.seed)
         torch.manual_seed(optimization_config.seed)
 
+        if isinstance(tensorboard_path, str):
+            tensorboard_path = pathlib.Path(tensorboard_path)
+
         return GaussianSplatReconstruction(
-            config=optimization_config,
+            model=model,
             sfm_scene=sfm_scene,
+            optimizer=optimizer,
+            config=optimization_config,
             optimizer_config=optimizer_config,
             train_indices=train_indices,
             val_indices=val_indices,
-            model=model,
-            optimizer=optimizer,
             pose_adjust_model=pose_adjust_model,
             pose_adjust_optimizer=pose_adjust_optimizer,
             pose_adjust_scheduler=pose_adjust_scheduler,
             start_step=global_step,
             run_name=run_name,
-            image_render_path=image_render_path,
-            stats_path=stats_path,
-            checkpoints_path=checkpoints_path,
-            tensorboard_path=tensorboard_path,
-            log_tensorboard_every=log_tensorboard_every,
-            log_images_to_tensorboard=log_images_to_tensorboard,
+            run_results_path=run_results_path,
             viewer=viewer,
-            update_viewer_every=update_viewer_every,
+            tensorboard_path=tensorboard_path,
+            eval_logs_images=save_eval_images,
+            tensorboard_log_interval=tensorboard_log_interval_steps,
+            viewer_log_interval=viewer_update_interval_epochs,
             _private=GaussianSplatReconstruction.__PRIVATE__,
         )
 
     def __init__(
         self,
+        model: GaussianSplat3d,
+        sfm_scene: SfmScene,
+        optimizer: GaussianSplatOptimizer,
         config: SceneOptimizationConfig,
         optimizer_config: GaussianSplatOptimizerConfig,
-        sfm_scene: SfmScene,
         train_indices: np.ndarray,
         val_indices: np.ndarray,
-        model: GaussianSplat3d,
-        optimizer: GaussianSplatOptimizer,
         pose_adjust_model: CameraPoseAdjustment | None,
         pose_adjust_optimizer: torch.optim.Adam | None,
         pose_adjust_scheduler: torch.optim.lr_scheduler.ExponentialLR | None,
         start_step: int,
         run_name: str,
-        image_render_path: pathlib.Path | None,
-        stats_path: pathlib.Path | None,
-        checkpoints_path: pathlib.Path | None,
+        run_results_path: pathlib.Path | None,
+        viewer: Viewer | None,
         tensorboard_path: pathlib.Path | None,
-        log_tensorboard_every: int,
-        log_images_to_tensorboard: bool,
-        viewer: Viewer | None = None,
-        update_viewer_every: int = 10,
+        eval_logs_images: bool,
+        tensorboard_log_interval: int,
+        viewer_log_interval: int,
         _private: object | None = None,
     ) -> None:
         """
@@ -552,13 +428,13 @@ class GaussianSplatReconstruction:
         Note: This constructor should only be called by the `new_run` or `resume_from_checkpoint` methods.
 
         Args:
+            model (GaussianSplat3d): The Gaussian Splatting model to train.
+            sfm_scene (SfmScene): The Structure-from-Motion scene.
+            optimizer (GaussianSplatOptimizer | None): The optimizer for the model.
             config (Config): Configuration object containing model parameters.
             optimizer_config (GaussianSplatOptimizerConfig): Configuration for the optimizer.
-            sfm_scene (SfmScene): The Structure-from-Motion scene.
             train_indices (np.ndarray): The indices for the training set.
             val_indices (np.ndarray): The indices for the validation set.
-            model (GaussianSplat3d): The Gaussian Splatting model to train.
-            optimizer (GaussianSplatOptimizer | None): The optimizer for the model.
             pose_adjust_model (CameraPoseAdjustment | None): The camera pose adjustment model, if used
             pose_adjust_optimizer (torch.optim.Adam | None): The optimizer for camera pose adjustment, if used.
             pose_adjust_scheduler (torch.optim.lr_scheduler.ExponentialLR | None): The learning rate scheduler
@@ -566,14 +442,11 @@ class GaussianSplatReconstruction:
             start_step (int): The step to start training from (useful for resuming training
                 from a checkpoint).
             run_name (str | None): The name of the training run or None for an un-named run.
-            image_render_path (pathlib.Path | None): Path to save rendered images during evaluation.
-            stats_path (pathlib.Path | None): Path to save training statistics
-            checkpoints_path (pathlib.Path | None): Path to save model checkpoints.
-            tensorboard_path (pathlib.Path | None): Path to save TensorBoard logs.
-            log_tensorboard_every (int): How often to log metrics to TensorBoard.
-            log_images_to_tensorboard (bool): Whether to log images to TensorBoard.
+            run_results_path (pathlib.Path | None): The base path to save results for this run.
             viewer (Viewer | None): The viewer instance to use for this run.
-            update_viewer_every (int): How often to update the viewer with new training information.
+            tensorboard_path (pathlib.Path | None): The path to save TensorBoard logs or None to disable.
+            tensorboard_log_interval (int): Interval (in steps) at which to log to TensorBoard if a path is specified.
+            viewer_log_interval (int): Interval (in epochs) at which to update the viewer with new results if a viewer is specified.
             _private (object | None): Private object to ensure this class is only initialized through `new_run` or `resume_from_checkpoint`.
         """
         if _private is not GaussianSplatReconstruction.__PRIVATE__:
@@ -589,7 +462,7 @@ class GaussianSplatReconstruction:
         self._pose_adjust_optimizer = pose_adjust_optimizer
         self._pose_adjust_scheduler = pose_adjust_scheduler
         self._start_step = start_step
-        self._update_viewer_every = update_viewer_every
+        self._update_viewer_every = viewer_log_interval
 
         self._sfm_scene = sfm_scene
         self._training_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=train_indices)
@@ -597,24 +470,35 @@ class GaussianSplatReconstruction:
 
         self.device = model.device
 
+        # Set up directories for saving results if a results path is provided
         self._run_name = run_name
-        self._image_render_path = image_render_path
-        self._stats_path = stats_path
-        self._checkpoints_path = checkpoints_path
+        self._results_path = run_results_path
+        if self._results_path is not None:
+            self._image_render_path = self._results_path / "eval_renders" if eval_logs_images else None
+            self._stats_path = self._results_path / "stats"
+            self._checkpoints_path = self._results_path / "checkpoints"
+
+            self._stats_path.mkdir(parents=True, exist_ok=True)
+            self._checkpoints_path.mkdir(parents=True, exist_ok=True)
+            if self._image_render_path is not None:
+                self._image_render_path.mkdir(parents=True, exist_ok=True)
+        else:
+            self._image_render_path = None
+            self._stats_path = None
+            self._checkpoints_path = None
 
         self._global_step: int = 0
 
-        # Tensorboard
-        self._tensorboard_logger = None
-        if tensorboard_path is not None and optimizer is not None and log_tensorboard_every > 0:
-            self._tensorboard_logger = TensorboardLogger(
-                log_dir=tensorboard_path,
-                log_every_step=log_tensorboard_every,
-                log_images_to_tensorboard=log_images_to_tensorboard,
-            )
+        # Create an optional TensorBoard summary writer.
+        if tensorboard_path is not None and tensorboard_log_interval > 0:
+            tensorboard_run_path = tensorboard_path / self._run_name
+            tensorboard_run_path.mkdir(parents=True, exist_ok=True)
+            self._summary_writer = SummaryWriter(log_dir=str(tensorboard_run_path))
+        else:
+            self._summary_writer = None
+        self._tensorboard_log_interval: int = tensorboard_log_interval
 
-        # Viewer
-        # self._viewer = ViewerLogger(self.model, self._training_dataset) if not disable_viewer else None
+        # Setup viewer for visualizing training progress if a Viewer is provided.
         self._viewer = viewer
         if self._viewer is not None:
             with torch.no_grad():
@@ -627,9 +511,9 @@ class GaussianSplatReconstruction:
                 )
                 first_cam_pos = self._training_dataset.camera_to_world_matrices[0, :3, 3]
                 self._viewer.set_camera_lookat(
-                    camera_origin=first_cam_pos,
-                    lookat_point=self.model.means.mean(dim=0).cpu().numpy(),
-                    up_direction=[0, 0, -1],
+                    eye=first_cam_pos,
+                    center=self.model.means.mean(dim=0).cpu().numpy(),
+                    up=[0, 0, -1],
                 )
                 # image_sizes = torch.from_numpy(self._training_dataset.image_sizes.astype(np.int32))
                 # self._viewer.add_camera_view(
@@ -638,6 +522,7 @@ class GaussianSplatReconstruction:
                 #     projection_matrices=train_projection_matrices,
                 #     image_sizes=image_sizes,
                 # )
+
         # Losses & Metrics.
         if self.config.lpips_net == "alex":
             self._lpips = LPIPSLoss(backbone="alex").to(model.device)
@@ -646,6 +531,25 @@ class GaussianSplatReconstruction:
             self._lpips = LPIPSLoss(backbone="vgg").to(model.device)
         else:
             raise ValueError(f"Unknown LPIPS network: {self.config.lpips_net}")
+
+    def _tensorboard_log_train(
+        self, loss: float, l1loss: float, ssimloss: float, sh_degree: int, pose_loss: float | None = None
+    ):
+        if self._summary_writer is None:
+            return
+
+        mem_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        mem_reserved = torch.cuda.max_memory_reserved() / 1024**3
+
+        self._summary_writer.add_scalar("train/loss", loss, self._global_step)
+        self._summary_writer.add_scalar("train/l1loss", l1loss, self._global_step)
+        self._summary_writer.add_scalar("train/ssimloss", ssimloss, self._global_step)
+        if pose_loss is not None:
+            self._summary_writer.add_scalar("train/pose_loss", pose_loss, self._global_step)
+        self._summary_writer.add_scalar("train/num_gaussians", self._model.num_gaussians, self._global_step)
+        self._summary_writer.add_scalar("train/sh_degree", sh_degree, self._global_step)
+        self._summary_writer.add_scalar("train/mem_allocated", mem_allocated, self._global_step)
+        self._summary_writer.add_scalar("train/mem_reserved", mem_reserved, self._global_step)
 
     def _save_statistics(self, step: int, stage: str, stats: dict) -> None:
         """
@@ -742,28 +646,23 @@ class GaussianSplatReconstruction:
         )
 
     @classmethod
-    def _make_or_get_results_directories(
+    def _make_run_directory(
         cls,
         run_name: str | None,
         results_base_path: pathlib.Path | None,
-        save_eval_images: bool,
-        exists_ok: bool = True,
-    ) -> tuple[str, pathlib.Path | None, pathlib.Path | None, pathlib.Path | None, pathlib.Path | None]:
+        exists_ok: bool = False,
+    ):
         """
-        Create or get the paths to the results directories for the training run.
+        Create or get the path to the run directory for the training run.
 
         Args:
             run_name (str | None): The name of the run. If None, a unique name will be generated.
-            results_base_path (pathlib.Path): The base path where results will be saved.
-            save_eval_images (bool): Whether to save evaluation images during training.
+            results_base_path (pathlib.Path | None): The base path where results will be saved. If None, no results will be saved.
+                and the function will return None for the results path.
             exists_ok (bool): If True, will not raise an error if the run name already exists.
-
         Returns:
             run_name (str): The name of the run.
-            eval_render_path (pathlib.Path | None): Path to save evaluation renders, or None if not saving.
-            stats_path (pathlib.Path): Path to save statistics.
-            checkpoints_path (pathlib.Path): Path to save model checkpoints.
-            tensorboard_path (pathlib.Path): Path to save TensorBoard logs.
+            results_path (pathlib.Path | None): The path to the run directory, or None if no results path is provided.
         """
         logger = logging.getLogger(f"{cls.__module__}.{cls.__name__}")
 
@@ -773,44 +672,21 @@ class GaussianSplatReconstruction:
             if run_name is None:
                 run_name = str(uuid.uuid4())
                 logger.info(f"Generated a unique run name '{run_name}' for this run.")
-            return run_name, None, None, None, None
-
-        results_base_path.mkdir(exist_ok=True)
-
-        if run_name is None:
-            logger.info("No run name provided. Creating a new run directory.")
-            run_name, results_path = make_unique_name_directory_based_on_time(results_base_path, prefix="run")
+            return run_name, None
         else:
-            results_path = results_base_path / pathlib.Path(run_name)
-            if not results_path.exists():
-                logger.info(
-                    f"Run name {run_name} does not exist in results path {results_base_path}. Creating new run directory."
-                )
-                results_path.mkdir(exist_ok=True)
+            results_base_path.mkdir(exist_ok=True)
+            if run_name is None:
+                run_name, results_path = make_unique_name_directory_based_on_time(results_base_path, prefix="run")
             else:
-                if not exists_ok:
+                results_path = results_base_path / pathlib.Path(run_name)
+                if not exists_ok and results_path.exists():
                     raise FileExistsError(
                         f"Run name {run_name} already exists in results path {results_base_path}. "
                         "Please provide a different run name or set exists_ok=True."
                     )
-                logger.info(f"Using existing run name {run_name} in results path {results_base_path}.")
-                logger.info(f"Results will be saved to {results_path.absolute()}.")
-
-        eval_render_path = None
-        if save_eval_images:
-            eval_render_path = results_path / pathlib.Path("eval_renders")
-            eval_render_path.mkdir(exist_ok=True)
-
-        stats_path = results_path / pathlib.Path("stats")
-        stats_path.mkdir(exist_ok=True)
-
-        checkpoints_path = results_path / pathlib.Path("checkpoints")
-        checkpoints_path.mkdir(exist_ok=True)
-
-        tensorboard_path = results_path / pathlib.Path("tb")
-        tensorboard_path.mkdir(exist_ok=True)
-
-        return run_name, eval_render_path, stats_path, checkpoints_path, tensorboard_path
+                results_path.mkdir(exist_ok=True)
+            logger.info(f"Created run named {run_name}. Results will be saved to {results_path.absolute()}.")
+            return run_name, results_path
 
     @torch.no_grad()
     def _splat_ply_metadata(self) -> dict[str, torch.Tensor | float | int | str]:
@@ -842,6 +718,27 @@ class GaussianSplatReconstruction:
             "antialias": int(self.config.antialias),
             "tile_size": self.config.tile_size,
         }
+
+    @property
+    def optimization_metadata(self) -> dict[str, torch.Tensor | float | int | str]:
+        """
+        Get metadata about the current optimization state, including camera parameters and scene scale.
+
+        Returns:
+            dict: A dictionary containing metadata about the optimization state. It's keys include:
+                - normalization_transform: The transformation matrix used to normalize the scene.
+                - camera_to_world_matrices: The optimized camera-to-world matrices for the training images.
+                - projection_matrices: The projection matrices for the training images.
+                - image_sizes: The sizes of the training images.
+                - scene_scale: The computed scale of the scene.
+                - eps2d: The 2D epsilon value used in rendering.
+                - near_plane: The near plane distance used in rendering.
+                - far_plane: The far plane distance used in rendering.
+                - min_radius_2d: The minimum 2D radius used in rendering.
+                - antialias: Whether anti-aliasing is enabled (1) or not (0).
+                - tile_size: The tile size used in rendering.
+        """
+        return self._splat_ply_metadata()
 
     @property
     def config(self) -> SceneOptimizationConfig:
@@ -1133,7 +1030,7 @@ class GaussianSplatReconstruction:
         )
         return pose_adjust_model, pose_adjust_optimizer, pose_adjust_scheduler
 
-    def train(self) -> tuple[GaussianSplat3d, dict[str, torch.Tensor | float | int | str]]:
+    def train(self):
         """
         Run the training loop for the Gaussian Splatting model.
 
@@ -1307,7 +1204,7 @@ class GaussianSplatReconstruction:
                         pose_reg = torch.mean(torch.abs(pose_params))
                         loss = loss + self.config.pose_opt_reg * pose_reg
                     else:
-                        pose_reg = torch.tensor(0.0, device=self.device)
+                        pose_reg = None
 
                     # If we're splitting into crops, accumulate gradients, so pass retain_graph=True
                     # for every crop but the last one
@@ -1382,21 +1279,17 @@ class GaussianSplatReconstruction:
                         self.pose_adjust_scheduler is not None
                     ), "Pose scheduler should be initialized if pose optimization is enabled."
                     self.pose_adjust_optimizer.step()
-                    self.pose_adjust_optimizer.zero_grad(set_to_none=True)
                     self.pose_adjust_scheduler.step()
+                    self.pose_adjust_optimizer.zero_grad(set_to_none=True)
 
                 # Log to tensorboard if you requested it
-                if self._tensorboard_logger is not None:
-                    self._tensorboard_logger.log_training_iteration(
-                        self._global_step,
-                        self.model.num_gaussians,
-                        loss.item(),
-                        l1loss.item(),
-                        ssimloss.item(),
-                        torch.cuda.max_memory_allocated() / 1024**3,
-                        pose_loss=pose_reg.item() if self.config.optimize_camera_poses else None,
-                        gt_img=pixels,
-                        pred_img=colors,
+                if self._summary_writer is not None and self._global_step % self._tensorboard_log_interval == 0:
+                    self._tensorboard_log_train(
+                        loss=loss.item(),
+                        l1loss=l1loss.item(),
+                        ssimloss=ssimloss.item(),
+                        sh_degree=sh_degree_to_use,
+                        pose_loss=pose_reg.item() if pose_reg is not None else None,
                     )
 
                 # Update the viewer
@@ -1466,8 +1359,6 @@ class GaussianSplatReconstruction:
             self._save_checkpoint_and_ply(ckpt_path, ply_path)
         else:
             self._logger.info("Training completed. No checkpoints path specified, not saving final checkpoint.")
-
-        return self._model, self._splat_ply_metadata()
 
     @torch.no_grad()
     def eval(self, stage: str = "val"):
@@ -1555,15 +1446,12 @@ class GaussianSplatReconstruction:
         self._save_statistics(self._global_step, stage, stats)
 
         # Log to tensorboard if enabled
-        if self._tensorboard_logger is not None:
-            self._tensorboard_logger.log_evaluation_iteration(
-                self._global_step,
-                psnr_mean.item(),
-                ssim_mean.item(),
-                lpips_mean.item(),
-                evaluation_time,
-                self.model.num_gaussians,
-            )
+        if self._summary_writer is not None:
+            self._summary_writer.add_scalar("PSNR", psnr_mean.item(), self._global_step)
+            self._summary_writer.add_scalar("SSIM", ssim_mean.item(), self._global_step)
+            self._summary_writer.add_scalar("LPIPS", lpips_mean.item(), self._global_step)
+            self._summary_writer.add_scalar("Evaluation Time", evaluation_time, self._global_step)
+            self._summary_writer.add_scalar("Num Gaussians", self.model.num_gaussians, self._global_step)
 
         # Update the viewer with evaluation results
         if self._viewer is not None:
