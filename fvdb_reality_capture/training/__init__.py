@@ -7,7 +7,7 @@ from .gaussian_splat_optimizer import (
     GaussianSplatOptimizerConfig,
     InsertionGrad2dThresholdMode,
 )
-from .scene_optimization_runner import (
+from .gaussian_splat_reconstruction import (
     GaussianSplatReconstruction,
     SceneOptimizationConfig,
 )
