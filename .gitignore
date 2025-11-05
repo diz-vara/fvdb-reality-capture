@@ -75,3 +75,4 @@ tests/data/
 **/frgs_logs/
 *.h264
 *.mp4
+*.ipynb_checkpoints
