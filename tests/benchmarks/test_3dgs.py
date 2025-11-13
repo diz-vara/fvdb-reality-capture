@@ -21,6 +21,7 @@ from fvdb_reality_capture.radiance_fields import (
     SfmDataset,
 )
 from fvdb_reality_capture.sfm_scene import SfmScene
+from fvdb_reality_capture.transforms import Compose, DownsampleImages, NormalizeScene
 
 logger = logging.getLogger("Benchmark 3dgs")
 
@@ -38,9 +39,7 @@ class Benchmark3dgs:
         checkpoint_path: str,
         results_path: Optional[pathlib.Path] = None,
         image_downsample_factor: int = 4,
-        points_percentile_filter: float = 0.0,
         normalization_type: Literal["none", "pca", "ecef2enu", "similarity"] = "pca",
-        crop_bbox: tuple[float, float, float, float, float, float] | None = None,
         device: Union[str, torch.device] = "cuda",
     ):
         self.data_path = data_path
@@ -63,7 +62,16 @@ class Benchmark3dgs:
             run_name=run_name, save_path=pathlib.Path(self.results_path), config=writer_config, exist_ok=True
         )
 
-        self.runner = GaussianSplatReconstruction.from_state_dict(checkpoint_state, writer=writer, device=device)
+        # recreate the cache by loading the scene from the data path and applying the same transforms
+        sfm_scene = SfmScene.from_colmap(self.data_path)
+        sfm_scene = Compose(
+            NormalizeScene(normalization_type),
+            DownsampleImages(image_downsample_factor),
+        )(sfm_scene)
+
+        self.runner = GaussianSplatReconstruction.from_state_dict(
+            checkpoint_state, override_sfm_scene=sfm_scene, writer=writer, device=device
+        )
 
         step = checkpoint_state["step"]
 
@@ -71,7 +79,7 @@ class Benchmark3dgs:
             self.runner.training_dataset,
             batch_size=self.runner.config.batch_size,
             shuffle=False,  # for benchmarking always use the same order of the dataset
-            num_workers=8,
+            num_workers=4,  # use 4 workers based on CI runner resources
             persistent_workers=True,
             pin_memory=True,
         )
@@ -149,9 +157,11 @@ def create_benchmark_params():
 
     params = []
 
+    data_base_path = config["paths"]["data_base"]
+
     for dataset_config in config["datasets"]:
         dataset_name = dataset_config["name"]
-        dataset_path = dataset_config["path"]
+        dataset_path = str(pathlib.Path(data_base_path) / dataset_config["path"])
         run_path = dataset_config["run_directory"]
 
         logger.info(f"Dataset: {dataset_name}")

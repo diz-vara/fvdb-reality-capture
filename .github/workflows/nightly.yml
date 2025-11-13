@@ -16,14 +16,36 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write  # Required to push benchmark results to gh-pages
   deployments: read
   pull-requests: read
   issues: read
+  actions: read  # Required to download artifacts from previous workflow runs
   # Need ID token write permission to use OIDC
   id-token: write
 
 jobs:
+  # Get current commit hash of fvdb-core main and store in a variable
+  get-fvdb-core-commit-hash:
+    name: Get fvdb-core commit hash
+    runs-on: ubuntu-latest
+    outputs:
+      fvdb_core_commit_hash: ${{ steps.get-commit-hash.outputs.fvdb_core_commit_hash }}
+    steps:
+      - name: Get fvdb-core commit hash
+        id: get-commit-hash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Install GitHub CLI if not already installed
+          if ! command -v gh &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+          # Use the GitHub CLI to fetch the latest commit hash from the main branch of fvdb-core
+          FVDB_CORE_COMMIT_HASH=$(gh api repos/openvdb/fvdb-core/commits/main --jq .sha)
+          echo "FVDB_CORE_COMMIT_HASH=${FVDB_CORE_COMMIT_HASH}"
+          echo "fvdb_core_commit_hash=${FVDB_CORE_COMMIT_HASH}" >> "$GITHUB_OUTPUT"
   ##############################################################################
   # BUILD FVDB
   ##############################################################################
@@ -53,7 +75,9 @@ jobs:
   fvdb-reality-capture-build:
     if: ${{ github.repository == 'openvdb/fvdb-reality-capture' }}
     name: fvdb-reality-capture Build
-    needs: start-build-runner # required to start the main job when the runner is ready
+    needs:
+      - get-fvdb-core-commit-hash
+      - start-build-runner # required to start the main job when the runner is ready
     runs-on: ${{ needs.start-build-runner.outputs.label }} # run the job on the newly created runner
     container:
       image: aswf/ci-openvdb:2024-clang17.2
@@ -71,31 +95,34 @@ jobs:
           fetch-depth: 0 # Fetch all history for all branches
           ref: "main"
 
+      - name: Try to download existing fvdb-core wheel
+        id: download_existing_wheel
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: fvdb-wheel-${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
+          path: fvdb-core/dist
+          workflow: nightly.yml
+          workflow_conclusion: ""  # Search in runs with any conclusion (success, failure, cancelled)
+          search_artifacts: true  # Search across multiple runs to find the artifact
+          if_no_artifact_found: fail
+
+      - name: Log if fvdb-core wheel already exists
+        if: steps.download_existing_wheel.outcome == 'success'
+        run: echo "Artifact 'fvdb-wheel-${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}' exists. No need to rebuild."
+
       # TODO: DRY this up with an anchor
       - name: Clone fvdb-core
+        if: steps.download_existing_wheel.outcome == 'failure'
         id: clone_fvdb_core
         run: |
           echo "Cloning fvdb-core"
           pwd
           git clone https://github.com/openvdb/fvdb-core.git
-          pushd fvdb-core
-          FVDB_CORE_COMMIT_HASH=$(git rev-parse HEAD)
-          echo "fvdb_core_commit_hash=$FVDB_CORE_COMMIT_HASH" >> "$GITHUB_OUTPUT"
-          popd
-
-      - name: Check if fvdb-core whl exists
-        uses: softwareforgood/check-artifact-v4-existence@v0
-        id: check_fvdb_core_wheel_artifact
-        with:
-          name: fvdb-wheel-${{ steps.clone_fvdb_core.outputs.fvdb_core_commit_hash }} # Replace with the actual name of your artifact
-
-      - name: Log if fvdb-core wheel already exists
-        if: steps.check_fvdb_core_wheel_artifact.outputs.exists == 'true'
-        run: echo "Artifact 'fvdb-wheel-${{ steps.clone_fvdb_core.outputs.fvdb_core_commit_hash }}' exists. No need to rebuild."
-        # Add further steps here that depend on the artifact's existence
+          git -C fvdb-core checkout ${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
 
       - name: Set up fvdb-core conda env
-        if: steps.check_fvdb_core_wheel_artifact.outputs.exists == 'false'
+        if: steps.download_existing_wheel.outcome == 'failure'
         uses: mamba-org/setup-micromamba@v2
         with:
           post-cleanup: 'all'
@@ -103,7 +130,7 @@ jobs:
           environment-file: fvdb-core/env/build_environment.yml
 
       - name: Build fvdb-core
-        if: steps.check_fvdb_core_wheel_artifact.outputs.exists == 'false'
+        if: steps.download_existing_wheel.outcome == 'failure'
         run: |
           echo "Building fvdb"
           cd fvdb-core
@@ -111,12 +138,12 @@ jobs:
           ./build.sh wheel verbose --cuda-arch-list '8.9+PTX'
 
       - name: Upload fvdb wheel
-        if: steps.check_fvdb_core_wheel_artifact.outputs.exists == 'false'
+        if: steps.download_existing_wheel.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: fvdb-wheel-${{ steps.clone_fvdb_core.outputs.fvdb_core_commit_hash }}
+          name: fvdb-wheel-${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
           path: fvdb-core/dist/*.whl
-          retention-days: 2
+          retention-days: 30
 
   fvdb-build-stop-runner:
     if: ${{ always() && github.repository == 'openvdb/fvdb-reality-capture' }}
@@ -174,7 +201,9 @@ jobs:
   ##############################################################################
   fvdb-reality-capture-unit-benchmarks:
     if: ${{ github.repository == 'openvdb/fvdb-reality-capture' }}
-    needs: start-benchmarks-gpu-runner # required to start the main job when the runner is ready
+    needs:
+      - get-fvdb-core-commit-hash
+      - start-benchmarks-gpu-runner # required to start the main job when the runner is ready
     name: fvdb-reality-capture Unit Benchmarks
     runs-on: ${{ needs.start-benchmarks-gpu-runner.outputs.label }} # run the job on the newly created runner
     container:
@@ -201,10 +230,7 @@ jobs:
           echo "Cloning fvdb"
           pwd
           git clone https://github.com/openvdb/fvdb-core.git
-          pushd fvdb-core
-          FVDB_CORE_COMMIT_HASH=$(git rev-parse HEAD)
-          echo "fvdb_core_commit_hash=$FVDB_CORE_COMMIT_HASH" >> "$GITHUB_OUTPUT"
-          popd
+          git -C fvdb-core checkout ${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
 
       - name: Set up fvdb Conda env
         uses: mamba-org/setup-micromamba@v2
@@ -215,10 +241,14 @@ jobs:
           environment-file: fvdb-core/env/dev_environment.yml
 
       - name: Download fvdb-core wheel
-        uses: actions/download-artifact@v4
+        uses: dawidd6/action-download-artifact@v3
         with:
-          name: fvdb-wheel-${{ steps.clone_fvdb_core.outputs.fvdb_core_commit_hash }}
+          name: fvdb-wheel-${{ needs.get-fvdb-core-commit-hash.outputs.fvdb_core_commit_hash }}
           path: ./dist
+          workflow: nightly.yml
+          workflow_conclusion: ""  # Search in runs with any conclusion (success, failure, cancelled)
+          search_artifacts: true  # Search across multiple runs to find the artifact
+          if_no_artifact_found: fail
 
       - name: Install wheels
         run: |
@@ -231,12 +261,19 @@ jobs:
           micromamba activate fvdb
           pip install -e .
 
+      - name: Download mipnerf360 dataset
+        run: |
+          echo "Downloading mipnerf360 dataset"
+          micromamba activate fvdb
+          frgs download mipnerf360 --download-path ./data
+
       - name: Download config and checkpoints from S3
         run: |
           echo "Downloading checkpoints from S3"
           micromamba activate fvdb
-          cd tests/benchmarks;
-          python tests/benchmarks/download_checkpoints_from_s3.py
+          pushd tests/benchmarks;
+          python download_checkpoints_from_s3.py
+          popd
 
       - name: Run benchmarks
         run: |
@@ -257,13 +294,6 @@ jobs:
             comment-on-alert: true
             fail-on-alert: true
             alert-comment-cc-users: '@openvdb/fvdb-dev'
-
-      - name: Cleanup
-        if: always()
-        run: |
-          echo "Cleaning up /__w/_temp directory"
-          sudo rm -rf /__w/_temp/*
-          echo "Cleanup completed"
 
   ##############################################################################
   # STOP FVDB TESTS GPU RUNNER
