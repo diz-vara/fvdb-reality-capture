@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1765366730116,
+  "lastUpdate": 1765452559160,
   "repoUrl": "https://github.com/openvdb/fvdb-reality-capture",
   "entries": {
     "fvdb-reality-capture Benchmark with pytest-benchmark": [
@@ -2120,6 +2120,112 @@ window.BENCHMARK_DATA = {
             "unit": "iter/sec",
             "range": "stddev: 0.0006849772997951247",
             "extra": "mean: 52.03535211524859 msec\nrounds: 564"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Matthew Cong",
+            "username": "matthewdcong",
+            "email": "1372750+matthewdcong@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "018a17874799ce1d3075fb51dc1a683608ef06bc",
+          "message": "Add aarch64 workaround (#190)\n\n`usd-core` does not have binary packages for aarch64. Without usd-core,\nany `frgs` functionality fails on import errors.\n\nTo workaround this, we use the `usd-exchange` package for aarch64. This\nprovides the majority of the necessary USD modules enabling `frgs` to\nrun on aarch64. However, it does not support `UsdVol` yet so the\nexporter itself won't function correctly and we need to defer the import\nin order to avoid an import error.\n\n---------\n\nSigned-off-by: Matthew Cong <mcong@nvidia.com>",
+          "timestamp": "2025-12-10T21:55:47Z",
+          "url": "https://github.com/openvdb/fvdb-reality-capture/commit/018a17874799ce1d3075fb51dc1a683608ef06bc"
+        },
+        "date": 1765452558674,
+        "tool": "pytest",
+        "benches": [
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_project_gaussians[garden-00000664]",
+            "value": 2349.222832862403,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00001524115196538837",
+            "extra": "mean: 425.6726888617685 usec\nrounds: 3950"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_render_gaussians[garden-00000664]",
+            "value": 695.8321401406891,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00003969691225931822",
+            "extra": "mean: 1.4371282128442813 msec\nrounds: 841"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_forward[garden-00000664]",
+            "value": 528.7575366734156,
+            "unit": "iter/sec",
+            "range": "stddev: 0.000026885228876507157",
+            "extra": "mean: 1.891225998009074 msec\nrounds: 502"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_backward[garden-00000664]",
+            "value": 192.03993673216615,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00003099252459644772",
+            "extra": "mean: 5.207250205433456 msec\nrounds: 774"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_project_gaussians[garden-00006640]",
+            "value": 111.81068126769762,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00004952704414160318",
+            "extra": "mean: 8.943689356527537 msec\nrounds: 230"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_render_gaussians[garden-00006640]",
+            "value": 125.523156301852,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00023153740142764457",
+            "extra": "mean: 7.966657543212572 msec\nrounds: 162"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_forward[garden-00006640]",
+            "value": 61.6637894032258,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00016190540938149344",
+            "extra": "mean: 16.216972873024364 msec\nrounds: 63"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_backward[garden-00006640]",
+            "value": 25.933912990205794,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00025356716783129905",
+            "extra": "mean: 38.559549435430746 msec\nrounds: 604"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_project_gaussians[garden-00016600]",
+            "value": 73.4568242460814,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00007579604988289918",
+            "extra": "mean: 13.613439054348252 msec\nrounds: 184"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_render_gaussians[garden-00016600]",
+            "value": 77.72379440910544,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00025025358736766495",
+            "extra": "mean: 12.866072836542433 msec\nrounds: 104"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_forward[garden-00016600]",
+            "value": 39.351195898389854,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0003242541831154352",
+            "extra": "mean: 25.412188299998206 msec\nrounds: 40"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_backward[garden-00016600]",
+            "value": 19.020100716911582,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00076156831693938",
+            "extra": "mean: 52.575957135224705 msec\nrounds: 562"
           }
         ]
       }
