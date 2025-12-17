@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1765885178235,
+  "lastUpdate": 1765971571914,
   "repoUrl": "https://github.com/openvdb/fvdb-reality-capture",
   "entries": {
     "fvdb-reality-capture Benchmark with pytest-benchmark": [
@@ -2332,6 +2332,112 @@ window.BENCHMARK_DATA = {
             "unit": "iter/sec",
             "range": "stddev: 0.00078831466423281",
             "extra": "mean: 52.07186783528887 msec\nrounds: 510"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Matthew Cong",
+            "username": "matthewdcong",
+            "email": "1372750+matthewdcong@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "fe904884917ad041498d16a122444bcce75ac799",
+          "message": "Fix incorrect cache path when resuming from checkpoint (#202)\n\nWhen starting a reconstruction from scratch, `get_cache` is called with\nthe `db_path.parent` (i.e. `_cache`) and `cache_root_path =\ndb.path.parent + ('/cache_1')` resolves to `_cache/cache_1` under which\nthe downsampled images and their associated file lock are stored.\nHowever, when resuming from a checkpoint, `get_cache` is incorrectly\ncalled with the `cache_root_path` which leads to a new subdirectory\nbeing created underneath the `cache_1` subdirectory resulting in a path\nsimilar to `_cache/cache_1/cache_1`. This directory nesting becomes\ndeeper each time you resume from a checkpoint ultimately resulting in a\npath similar to\n`_cache/cache_1/cache_1/cache_1/cache_1/cache_1/cache_1`.\n\nSigned-off-by: Matthew Cong <mcong@nvidia.com>",
+          "timestamp": "2025-12-15T21:17:13Z",
+          "url": "https://github.com/openvdb/fvdb-reality-capture/commit/fe904884917ad041498d16a122444bcce75ac799"
+        },
+        "date": 1765971571431,
+        "tool": "pytest",
+        "benches": [
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_project_gaussians[garden-00000664]",
+            "value": 2366.7678872100673,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00001531207851670745",
+            "extra": "mean: 422.51714052905896 usec\nrounds: 3743"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_render_gaussians[garden-00000664]",
+            "value": 703.834514562788,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0000360743894111374",
+            "extra": "mean: 1.4207885224571373 msec\nrounds: 846"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_forward[garden-00000664]",
+            "value": 533.3158085140069,
+            "unit": "iter/sec",
+            "range": "stddev: 0.000023706124712766606",
+            "extra": "mean: 1.875061612717479 msec\nrounds: 519"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_backward[garden-00000664]",
+            "value": 193.29411861090594,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00003739304397404378",
+            "extra": "mean: 5.173463151317934 msec\nrounds: 760"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_project_gaussians[garden-00006640]",
+            "value": 111.78590386786699,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00004848791712157515",
+            "extra": "mean: 8.945671729612872 msec\nrounds: 233"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_render_gaussians[garden-00006640]",
+            "value": 126.89762750620905,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00014441199176713255",
+            "extra": "mean: 7.880367975761175 msec\nrounds: 165"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_forward[garden-00006640]",
+            "value": 62.04605349697506,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00013275101849995647",
+            "extra": "mean: 16.11706053228274 msec\nrounds: 62"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_backward[garden-00006640]",
+            "value": 26.099972063087545,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0002512859314846347",
+            "extra": "mean: 38.314217255974455 msec\nrounds: 586"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_project_gaussians[garden-00016600]",
+            "value": 73.4820318612254,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00007374220203224113",
+            "extra": "mean: 13.608769037423347 msec\nrounds: 187"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_render_gaussians[garden-00016600]",
+            "value": 78.41796759424297,
+            "unit": "iter/sec",
+            "range": "stddev: 0.00031434966752768364",
+            "extra": "mean: 12.752179515468782 msec\nrounds: 97"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_forward[garden-00016600]",
+            "value": 39.59193221217003,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0003663331682677061",
+            "extra": "mean: 25.257671048765165 msec\nrounds: 41"
+          },
+          {
+            "name": "tests/benchmarks/test_3dgs.py::test_backward[garden-00016600]",
+            "value": 19.10364483580219,
+            "unit": "iter/sec",
+            "range": "stddev: 0.0007436041998394469",
+            "extra": "mean: 52.34603179629352 msec\nrounds: 540"
           }
         ]
       }
