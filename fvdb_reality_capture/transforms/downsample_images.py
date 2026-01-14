@@ -181,7 +181,6 @@ class DownsampleImages(BaseTransform):
                 if output_cache.has_file(cache_mask_filename):
                     mask_file_meta = output_cache.get_file_metadata(cache_mask_filename)
                     mask_path = str(mask_file_meta["path"])
-                    print("using cached mask", mask_path)
 
             new_image_metadata.append(
                 SfmPosedImageMetadata(
